@@ -57,11 +57,10 @@ func main() {
 // calling os.Exit directly so tests/main can compose cleanly.
 func run(args []string) int {
 	// `doctor` is a subcommand, not a flag — handle before flag parsing.
-	// Not yet implemented in Go; route to a placeholder so users see a
-	// clear message during the porting window.
 	if len(args) > 0 && args[0] == "doctor" {
-		fmt.Fprintln(os.Stderr, "doctor: not yet implemented in the Go port (see v0.1-bash tag)")
-		return 1
+		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer cancel()
+		return chomper.RunDoctor(ctx)
 	}
 
 	var (
