@@ -13,12 +13,15 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strings"
 	"syscall"
 
+	"github.com/martinremy/chomper/internal/chomper"
 	"github.com/martinremy/chomper/internal/config"
 	"github.com/martinremy/chomper/internal/gh"
+	"github.com/martinremy/chomper/internal/harness"
 )
 
 const usageText = `Usage: chomper [subcommand] [options]
@@ -63,7 +66,7 @@ func run(args []string) int {
 
 	var (
 		dryRun   bool
-		harness  string
+		harnessName string
 		title    string
 		labels   stringSlice
 		showHelp bool
@@ -72,7 +75,7 @@ func run(args []string) int {
 	fs.SetOutput(os.Stderr)
 	fs.Usage = func() { fmt.Fprint(os.Stderr, usageText) }
 	fs.BoolVar(&dryRun, "dry-run", false, "")
-	fs.StringVar(&harness, "harness", "", "")
+	fs.StringVar(&harnessName, "harness", "", "")
 	fs.StringVar(&title, "title", "", "")
 	fs.Var(&labels, "label", "")
 	fs.BoolVar(&showHelp, "help", false, "")
@@ -96,7 +99,7 @@ func run(args []string) int {
 		return 1
 	}
 	cfg.Apply(config.Overrides{
-		Harness:    harness,
+		Harness:    harnessName,
 		Labels:     labels,
 		TitleMatch: title,
 	})
@@ -155,8 +158,35 @@ func run(args []string) int {
 		return 0
 	}
 
-	// Beyond dry-run: not yet ported. Surface clearly so users know
-	// they need v0.1-bash for the full pipeline.
-	fmt.Fprintln(os.Stderr, "error: non-dry-run mode is not yet implemented in the Go port (use v0.1-bash for now)")
-	return 1
+	// Pick the harness. Verify the CLI is actually on PATH before
+	// committing to the loop; otherwise the first ProcessIssue dies
+	// halfway through.
+	h, err := harness.New(cfg.Harness)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %s\n", err)
+		return 1
+	}
+	if _, err := exec.LookPath(h.Name()); err != nil {
+		fmt.Fprintf(os.Stderr, "error: harness %q not found on PATH\n", h.Name())
+		return 1
+	}
+
+	deps := &chomper.Deps{
+		Cfg:     cfg,
+		Repo:    repo,
+		GH:      client,
+		Harness: h,
+	}
+
+	for _, iss := range matches {
+		if ctx.Err() != nil {
+			fmt.Fprintln(os.Stderr, "interrupted; stopping issue loop")
+			break
+		}
+		if err := chomper.ProcessIssue(ctx, deps, iss); err != nil {
+			fmt.Fprintf(os.Stderr, "error: process issue #%d: %s\n", iss.Number, err)
+			return 1
+		}
+	}
+	return 0
 }
