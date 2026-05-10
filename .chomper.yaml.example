@@ -1,0 +1,88 @@
+# .chomper.yaml — drop this file at the root of a repo you want to chomp.
+# All keys are optional; CLI flags override these; built-in defaults apply if
+# both are unset. Copy this to `.chomper.yaml` and edit; the real file is
+# gitignored.
+
+# Which AI harness to drive.
+#   claude  -> Anthropic Claude Code (`claude`)
+#   codex   -> OpenAI Codex CLI     (`codex`)
+# If unset and the configured one is missing, chomper falls back to whichever
+# CLI is on $PATH.
+harness: claude
+
+filter:
+  # Match an issue if it has ANY of these labels (OR logic).
+  # Built-in default (used when this key is unset or the list is empty):
+  #   ["chomper"]
+  # This keeps chomper deliberately scoped — only issues tagged for it are
+  # picked up unless you explicitly broaden the filter here or via --label
+  # flags. CLI flags fully replace the default.
+  labels:
+    - chomper
+  #   - bug
+  #   - good first issue
+
+  # Substring match on the issue title (case-insensitive). Empty = no
+  # title filter.
+  title_match: ""
+
+# How chomper merges the PR once CI is green: squash | merge | rebase.
+merge_strategy: squash
+
+# Max minutes to wait for PR checks to pass before giving up and moving on.
+ci_timeout_minutes: 30
+
+# Name of the trunk branch chomper resets to between issues and that PRs
+# target. Set this if your repo's default branch isn't `main` (e.g. master,
+# trunk, develop).
+trunk_branch: main
+
+# Auto-answer: route worker invocation through lib/judge.py, which watches
+# for silence in the worker's output stream and uses a smaller "judge"
+# instance of the same harness to classify the silence and synthesize
+# answers to questions the worker may ask (AskUserQuestion, plan-mode
+# approvals, free-text prompts, etc).
+# Requires python3. Opt-in - leave false to invoke the worker directly.
+auto_answer: false
+
+# Model for the judge calls. Empty = adapter default (Haiku for claude;
+# codex's default for codex).
+auto_answer_model: ""
+
+# Per-issue cap on synthesized answers. If exceeded, the issue is aborted
+# - more than a handful of questions on one issue usually signals the
+# agent is stuck or scope is wrong.
+auto_answer_max_questions: 5
+
+# Initial silence threshold in seconds before invoking the classifier.
+# The threshold backs off exponentially on "still working" verdicts so
+# long thinking passes don't trigger repeated classifier calls.
+auto_answer_silence_threshold_s: 30
+
+# Wait for code-review bots (e.g. CodeRabbit) to weigh in before merging.
+# Opt-in: leave `reviewers` empty to disable the whole review loop.
+#
+# Loop shape (per PR):
+#   CI passes -> for each iteration up to max_iterations:
+#     wait timeout_minutes for a review from any listed reviewer
+#       no review     -> proceed to merge (unless approve_state_required)
+#       APPROVED      -> proceed to merge
+#       COMMENT or CHANGES_REQUESTED -> if judge_adjudicates:
+#         judge says "merge_as_is" -> proceed to merge
+#         judge says "needs_fix"   -> re-invoke harness with review context,
+#                                     push fixes, re-poll CI, next iteration
+#         judge says "escalate"    -> preserve worktree, abort issue
+#       (if judge_adjudicates is false, any non-APPROVE -> needs_fix path)
+#
+# The harness reads review feedback via the gh CLI itself (option b: it
+# calls `gh pr view N --json reviews,reviewThreads,comments` and
+# `gh api repos/.../pulls/N/comments`), so this works with any reviewer
+# bot that uses GitHub's review API.
+wait_for_reviews:
+  reviewers: []                 # bot/user logins; empty disables the loop
+  # - coderabbitai
+  # - "greptileai[bot]"
+  timeout_minutes: 15           # max wait for a review per iteration
+  max_iterations: 10            # cap on revision rounds before giving up
+  judge_adjudicates: true       # use the judge to decide if review is actionable
+  approve_state_required: false # if true, an explicit APPROVE is required to merge

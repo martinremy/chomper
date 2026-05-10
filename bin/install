@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# bin/install — bootstrap chomper into PATH and verify the environment.
+#
+# Idempotent: re-run to update the symlink. Pass --target <dir> to override.
+#
+# Defaults to ~/.local/bin (user-owned). We deliberately do NOT install
+# into /opt/homebrew/bin or /usr/local/bin — those are package-manager
+# territory (Homebrew on macOS) and a user-installed CLI doesn't belong
+# in someone else's prefix. If you want chomper elsewhere, pass --target.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CHOMPER_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+SOURCE="$CHOMPER_DIR/chomper"
+
+err() { printf 'error: %s\n' "$*" >&2; }
+note() { printf '%s\n' "$*"; }
+
+if [ ! -x "$SOURCE" ]; then
+  err "$SOURCE is missing or not executable. Run from within the chomper repo."
+  exit 1
+fi
+
+# --- Parse args ----------------------------------------------------------
+TARGET_DIR=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --target)
+      [ "$#" -ge 2 ] || { err "--target requires a value"; exit 2; }
+      TARGET_DIR="$2"; shift 2 ;;
+    --help|-h)
+      cat <<'EOF'
+Usage: bin/install [--target <dir>]
+
+Symlinks the chomper executable into ~/.local/bin (created if missing)
+and runs `chomper doctor` to verify the environment.
+
+Pass --target /your/dir to install elsewhere. We deliberately do not
+default to /opt/homebrew/bin or /usr/local/bin — those are Homebrew's
+prefix on macOS, and a user-installed CLI shouldn't live there.
+EOF
+      exit 0 ;;
+    *)
+      err "unknown option: $1"
+      exit 2 ;;
+  esac
+done
+
+# --- Worktree-source warning ---------------------------------------------
+git_dir="$(git -C "$CHOMPER_DIR" rev-parse --git-dir 2>/dev/null || true)"
+if [ -n "$git_dir" ]; then
+  # In a linked worktree, .git is a file pointing at <repo>/.git/worktrees/<name>
+  case "$git_dir" in
+    *"/worktrees/"*)
+      note "warning: installing from a worktree:"
+      note "  $CHOMPER_DIR"
+      note "  this symlink will break if you 'git worktree remove' the dir."
+      note "  Consider merging the branch to main and installing from the main"
+      note "  checkout instead."
+      echo
+      ;;
+  esac
+fi
+
+# --- Choose install location ---------------------------------------------
+# Default to ~/.local/bin (user-owned, XDG-style). Auto-create it if it
+# doesn't exist, since that's a safe operation in the user's own $HOME.
+# For any other target (--target), require the directory to already exist
+# — the user explicitly named it, so we don't second-guess where to create.
+USER_CHOSE_TARGET=1
+if [ -z "$TARGET_DIR" ]; then
+  TARGET_DIR="$HOME/.local/bin"
+  USER_CHOSE_TARGET=0
+fi
+
+if [ ! -d "$TARGET_DIR" ]; then
+  if [ "$USER_CHOSE_TARGET" -eq 0 ]; then
+    if ! mkdir -p "$TARGET_DIR"; then
+      err "could not create $TARGET_DIR; pass --target /your/dir to install elsewhere."
+      exit 1
+    fi
+    note "created $TARGET_DIR"
+  else
+    err "$TARGET_DIR does not exist."
+    exit 1
+  fi
+fi
+
+if [ ! -w "$TARGET_DIR" ]; then
+  err "$TARGET_DIR is not writable."
+  exit 1
+fi
+
+# Verify the chosen dir is on PATH; without that the symlink is invisible.
+case ":$PATH:" in
+  *":$TARGET_DIR:"*) ;;
+  *)
+    {
+      printf 'error: %s is not on your PATH.\n\n' "$TARGET_DIR"
+      printf 'Add this to your shell rc (~/.zshrc, ~/.bashrc, ~/.profile):\n'
+      printf '  export PATH="$HOME/.local/bin:$PATH"\n\n'
+      printf "Then open a new terminal (or 'source' the file) and re-run bin/install.\n"
+      printf 'Or pass --target /some/dir/already/on/PATH.\n'
+    } >&2
+    exit 1
+    ;;
+esac
+
+TARGET="$TARGET_DIR/chomper"
+
+# --- Link (or relink) ----------------------------------------------------
+if [ -L "$TARGET" ]; then
+  current="$(readlink "$TARGET")"
+  if [ "$current" = "$SOURCE" ]; then
+    note "chomper already installed at $TARGET (pointing here)."
+  else
+    note "replacing existing symlink:"
+    note "  $TARGET"
+    note "    was: $current"
+    note "    now: $SOURCE"
+    rm "$TARGET"
+    ln -s "$SOURCE" "$TARGET"
+  fi
+elif [ -e "$TARGET" ]; then
+  err "$TARGET exists and is not a symlink. Refusing to overwrite."
+  err "Inspect it manually, or pass --target to install elsewhere."
+  exit 1
+else
+  ln -s "$SOURCE" "$TARGET"
+  note "installed: $TARGET -> $SOURCE"
+fi
+
+# --- Verify on PATH ------------------------------------------------------
+echo
+if ! command -v chomper >/dev/null 2>&1; then
+  err "chomper installed at $TARGET but not visible on PATH."
+  err "Restart your shell, or 'source' your rc, or add $TARGET_DIR to PATH."
+  exit 1
+fi
+note "which chomper: $(command -v chomper)"
+echo
+
+# --- Hand off to doctor --------------------------------------------------
+"$SOURCE" doctor

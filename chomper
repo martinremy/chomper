@@ -1,0 +1,848 @@
+#!/usr/bin/env bash
+# chomper — sequentially work GitHub issues to PR merge using an AI harness.
+#
+# Run from inside any GitHub repo. Reads optional ./.chomper.yaml for
+# defaults. Filters open issues, then for each: branch, prompt the harness,
+# wait for the PR, wait for CI, merge.
+
+set -euo pipefail
+
+# --- Locate this script's lib/ directory (handles symlinks) ---------------
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+while [ -L "$SCRIPT_PATH" ]; do
+  link_dir="$(cd -P "$(dirname "$SCRIPT_PATH")" && pwd)"
+  SCRIPT_PATH="$(readlink "$SCRIPT_PATH")"
+  case "$SCRIPT_PATH" in
+    /*) ;;
+    *)  SCRIPT_PATH="$link_dir/$SCRIPT_PATH" ;;
+  esac
+done
+CHOMPER_DIR="$(cd -P "$(dirname "$SCRIPT_PATH")" && pwd)"
+
+# shellcheck source=lib/github.sh
+. "$CHOMPER_DIR/lib/github.sh"
+# shellcheck source=lib/prompt_builder.sh
+. "$CHOMPER_DIR/lib/prompt_builder.sh"
+
+# --- Logging helpers -----------------------------------------------------
+err()  { printf '%s\n' "$*" >&2; }
+die()  { err "error: $*"; exit 1; }
+info() { printf '%s\n' "$*"; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+
+# --- Heartbeat: spinner + elapsed time while the harness is busy ---------
+# Background subshell prints to stderr with \r-overwrite so it stays on one
+# line. Only active when stderr is a TTY (avoids garbage in log redirection).
+# The child traps TERM/INT to clear its own line before exiting.
+_HEARTBEAT_PID=''
+
+_start_heartbeat() {
+  local label="${1:-working}"
+  [ -t 2 ] || return 0
+  local start
+  start=$(date +%s)
+  (
+    trap 'printf "\r\033[K" >&2; exit 0' TERM INT
+    local frames=( '|' '/' '-' '\\' )
+    local i=0 elapsed mm ss
+    while :; do
+      elapsed=$(( $(date +%s) - start ))
+      mm=$((elapsed / 60))
+      ss=$((elapsed % 60))
+      printf '\r\033[K\033[2m%s %s [%02d:%02d]\033[0m' \
+        "${frames[i % 4]}" "$label" "$mm" "$ss" >&2
+      i=$((i + 1))
+      sleep 1
+    done
+  ) &
+  _HEARTBEAT_PID=$!
+  # Suppress shell job-control noise on completion
+  disown "$_HEARTBEAT_PID" 2>/dev/null || true
+}
+
+_stop_heartbeat() {
+  [ -n "$_HEARTBEAT_PID" ] || return 0
+  kill "$_HEARTBEAT_PID" 2>/dev/null || true
+  wait "$_HEARTBEAT_PID" 2>/dev/null || true
+  _HEARTBEAT_PID=''
+  # Final clear, in case the trap inside the child raced with kill
+  [ -t 2 ] && printf '\r\033[K' >&2
+}
+
+# --- Defaults ------------------------------------------------------------
+DEFAULT_HARNESS='claude'
+DEFAULT_TITLE_MATCH=''
+DEFAULT_MERGE_STRATEGY='squash'
+DEFAULT_CI_TIMEOUT_MINUTES=30
+DEFAULT_TRUNK_BRANCH='main'
+DEFAULT_AUTO_ANSWER='false'
+DEFAULT_AUTO_ANSWER_MODEL=''
+DEFAULT_AUTO_ANSWER_MAX_QUESTIONS=5
+DEFAULT_AUTO_ANSWER_SILENCE_THRESHOLD_S=30
+DEFAULT_LABELS=('chomper')
+
+# Wait-for-reviews defaults — opt-in. reviewers=[] disables the whole loop.
+DEFAULT_REVIEWERS=()
+DEFAULT_REVIEW_TIMEOUT_MINUTES=15
+DEFAULT_REVIEW_MAX_ITERATIONS=10
+DEFAULT_REVIEW_JUDGE_ADJUDICATES='true'
+DEFAULT_REVIEW_APPROVE_REQUIRED='false'
+
+# --- Mutable state -------------------------------------------------------
+ARG_HARNESS=''
+ARG_LABELS=()
+ARG_TITLE=''
+DRY_RUN=0
+DOCTOR=0
+
+CONFIG_HARNESS=''
+CONFIG_LABELS=()
+CONFIG_TITLE_MATCH=''
+CONFIG_MERGE_STRATEGY=''
+CONFIG_CI_TIMEOUT_MINUTES=''
+CONFIG_TRUNK_BRANCH=''
+CONFIG_AUTO_ANSWER=''
+CONFIG_AUTO_ANSWER_MODEL=''
+CONFIG_AUTO_ANSWER_MAX_QUESTIONS=''
+CONFIG_AUTO_ANSWER_SILENCE_THRESHOLD_S=''
+CONFIG_REVIEW_REVIEWERS=()
+CONFIG_REVIEW_TIMEOUT_MINUTES=''
+CONFIG_REVIEW_MAX_ITERATIONS=''
+CONFIG_REVIEW_JUDGE_ADJUDICATES=''
+CONFIG_REVIEW_APPROVE_REQUIRED=''
+
+HARNESS=''
+LABELS=()
+TITLE_MATCH=''
+MERGE_STRATEGY=''
+CI_TIMEOUT_MINUTES=0
+TRUNK_BRANCH=''
+AUTO_ANSWER='false'
+AUTO_ANSWER_MODEL=''
+AUTO_ANSWER_MAX_QUESTIONS=0
+AUTO_ANSWER_SILENCE_THRESHOLD_S=0
+REVIEWERS=()
+REVIEW_TIMEOUT_MINUTES=0
+REVIEW_MAX_ITERATIONS=0
+REVIEW_JUDGE_ADJUDICATES='false'
+REVIEW_APPROVE_REQUIRED='false'
+REPO=''
+
+usage() {
+  cat <<'EOF'
+Usage: chomper [subcommand] [options]
+
+Sequentially work open issues in the current GitHub repo to merged PRs.
+
+Subcommands:
+  doctor                     audit local environment (deps, auth, config)
+
+Options:
+  --harness <claude|codex>   override harness from config
+  --label <label>            filter by label (repeatable; OR logic)
+  --title <string>           filter by title substring (case-insensitive)
+  --dry-run                  print matching issues and exit
+  --help, -h                 show this message
+EOF
+}
+
+# --- Arg parsing ---------------------------------------------------------
+parse_args() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      doctor)    DOCTOR=1; shift ;;
+      --harness)
+        [ "$#" -ge 2 ] || die "--harness requires a value"
+        ARG_HARNESS="$2"; shift 2 ;;
+      --label)
+        [ "$#" -ge 2 ] || die "--label requires a value"
+        ARG_LABELS+=("$2"); shift 2 ;;
+      --title)
+        [ "$#" -ge 2 ] || die "--title requires a value"
+        ARG_TITLE="$2"; shift 2 ;;
+      --dry-run) DRY_RUN=1; shift ;;
+      --help|-h) usage; exit 0 ;;
+      --) shift; break ;;
+      -*) die "unknown option: $1" ;;
+      *)  die "unexpected argument: $1" ;;
+    esac
+  done
+}
+
+# --- Config loading ------------------------------------------------------
+# Reads ./.chomper.yaml via lib/parse_config.py — a small Python parser
+# scoped to chomper's YAML subset. We require python3 here; the previous
+# yq + awk-fallback split silently dropped list-valued keys when yq was
+# missing, which silently broke filter.labels for users without yq.
+load_config() {
+  local config="$PWD/.chomper.yaml"
+  [ -f "$config" ] || return 0
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    die "python3 is required to read .chomper.yaml. Install python3 (or remove ./.chomper.yaml to use built-in defaults)."
+  fi
+
+  local parsed err_output
+  err_output="$(mktemp)"
+  if ! parsed="$(python3 "$CHOMPER_DIR/lib/parse_config.py" "$config" 2>"$err_output")"; then
+    local err
+    err="$(cat "$err_output")"
+    rm -f "$err_output"
+    die "failed to parse $config: $err"
+  fi
+  rm -f "$err_output"
+
+  # parse_config.py emits shlex-quoted assignments only, so eval is safe.
+  eval "$parsed"
+}
+
+# --- Settings resolution (CLI > config > default) ------------------------
+resolve_settings() {
+  HARNESS="${ARG_HARNESS:-${CONFIG_HARNESS:-$DEFAULT_HARNESS}}"
+  TITLE_MATCH="${ARG_TITLE:-${CONFIG_TITLE_MATCH:-$DEFAULT_TITLE_MATCH}}"
+  MERGE_STRATEGY="${CONFIG_MERGE_STRATEGY:-$DEFAULT_MERGE_STRATEGY}"
+  CI_TIMEOUT_MINUTES="${CONFIG_CI_TIMEOUT_MINUTES:-$DEFAULT_CI_TIMEOUT_MINUTES}"
+  TRUNK_BRANCH="${CONFIG_TRUNK_BRANCH:-$DEFAULT_TRUNK_BRANCH}"
+  AUTO_ANSWER="${CONFIG_AUTO_ANSWER:-$DEFAULT_AUTO_ANSWER}"
+  AUTO_ANSWER_MODEL="${CONFIG_AUTO_ANSWER_MODEL:-$DEFAULT_AUTO_ANSWER_MODEL}"
+  AUTO_ANSWER_MAX_QUESTIONS="${CONFIG_AUTO_ANSWER_MAX_QUESTIONS:-$DEFAULT_AUTO_ANSWER_MAX_QUESTIONS}"
+  AUTO_ANSWER_SILENCE_THRESHOLD_S="${CONFIG_AUTO_ANSWER_SILENCE_THRESHOLD_S:-$DEFAULT_AUTO_ANSWER_SILENCE_THRESHOLD_S}"
+
+  if [ "${#CONFIG_REVIEW_REVIEWERS[@]}" -gt 0 ]; then
+    REVIEWERS=("${CONFIG_REVIEW_REVIEWERS[@]}")
+  else
+    REVIEWERS=("${DEFAULT_REVIEWERS[@]+"${DEFAULT_REVIEWERS[@]}"}")
+  fi
+  REVIEW_TIMEOUT_MINUTES="${CONFIG_REVIEW_TIMEOUT_MINUTES:-$DEFAULT_REVIEW_TIMEOUT_MINUTES}"
+  REVIEW_MAX_ITERATIONS="${CONFIG_REVIEW_MAX_ITERATIONS:-$DEFAULT_REVIEW_MAX_ITERATIONS}"
+  REVIEW_JUDGE_ADJUDICATES="${CONFIG_REVIEW_JUDGE_ADJUDICATES:-$DEFAULT_REVIEW_JUDGE_ADJUDICATES}"
+  REVIEW_APPROVE_REQUIRED="${CONFIG_REVIEW_APPROVE_REQUIRED:-$DEFAULT_REVIEW_APPROVE_REQUIRED}"
+
+  if [ "${#ARG_LABELS[@]}" -gt 0 ]; then
+    LABELS=("${ARG_LABELS[@]}")
+  elif [ "${#CONFIG_LABELS[@]}" -gt 0 ]; then
+    LABELS=("${CONFIG_LABELS[@]}")
+  else
+    LABELS=("${DEFAULT_LABELS[@]+"${DEFAULT_LABELS[@]}"}")
+  fi
+
+  case "$HARNESS" in
+    claude|codex) ;;
+    *) die "invalid harness: $HARNESS (use claude or codex)" ;;
+  esac
+
+  case "$MERGE_STRATEGY" in
+    squash|merge|rebase) ;;
+    *) die "invalid merge_strategy: $MERGE_STRATEGY (use squash|merge|rebase)" ;;
+  esac
+
+  case "$CI_TIMEOUT_MINUTES" in
+    ''|*[!0-9]*) die "invalid ci_timeout_minutes: $CI_TIMEOUT_MINUTES (must be a positive integer)" ;;
+  esac
+
+  case "$AUTO_ANSWER" in
+    true|false) ;;
+    *) die "invalid auto_answer: $AUTO_ANSWER (use true or false)" ;;
+  esac
+
+  case "$AUTO_ANSWER_MAX_QUESTIONS" in
+    ''|*[!0-9]*) die "invalid auto_answer_max_questions: $AUTO_ANSWER_MAX_QUESTIONS (must be a positive integer)" ;;
+  esac
+
+  case "$AUTO_ANSWER_SILENCE_THRESHOLD_S" in
+    ''|*[!0-9]*) die "invalid auto_answer_silence_threshold_s: $AUTO_ANSWER_SILENCE_THRESHOLD_S (must be a positive integer)" ;;
+  esac
+
+  case "$REVIEW_TIMEOUT_MINUTES" in
+    ''|*[!0-9]*) die "invalid wait_for_reviews.timeout_minutes: $REVIEW_TIMEOUT_MINUTES (must be a positive integer)" ;;
+  esac
+  case "$REVIEW_MAX_ITERATIONS" in
+    ''|*[!0-9]*) die "invalid wait_for_reviews.max_iterations: $REVIEW_MAX_ITERATIONS (must be a positive integer)" ;;
+  esac
+  case "$REVIEW_JUDGE_ADJUDICATES" in
+    true|false) ;;
+    *) die "invalid wait_for_reviews.judge_adjudicates: $REVIEW_JUDGE_ADJUDICATES (use true or false)" ;;
+  esac
+  case "$REVIEW_APPROVE_REQUIRED" in
+    true|false) ;;
+    *) die "invalid wait_for_reviews.approve_state_required: $REVIEW_APPROVE_REQUIRED (use true or false)" ;;
+  esac
+}
+
+# --- Harness selection ---------------------------------------------------
+# Resolve harness: fall back to whichever CLI is on PATH if the configured
+# one is missing and the user didn't pin it explicitly. Validates only -
+# adapter sourcing is handled by source_worker_adapter (or judge.py).
+select_harness() {
+  if [ -z "$ARG_HARNESS" ] && [ -z "$CONFIG_HARNESS" ]; then
+    if ! command -v "$HARNESS" >/dev/null 2>&1; then
+      if   command -v claude >/dev/null 2>&1; then HARNESS='claude'
+      elif command -v codex  >/dev/null 2>&1; then HARNESS='codex'
+      fi
+    fi
+  fi
+
+  case "$HARNESS" in
+    claude|codex) ;;
+    *) die "unknown harness: $HARNESS (use claude or codex)" ;;
+  esac
+
+  if ! command -v "$HARNESS" >/dev/null 2>&1; then
+    die "harness '$HARNESS' not found on PATH (and no fallback available). Install claude or codex, or pass --harness."
+  fi
+
+  if [ "$AUTO_ANSWER" = "true" ] && ! command -v python3 >/dev/null 2>&1; then
+    die "auto_answer is enabled but python3 is not on PATH"
+  fi
+}
+
+# Source the worker adapter so `harness_run_worker` is callable from this
+# shell. Only needed when chomper runs the worker directly (auto_answer=false).
+source_worker_adapter() {
+  case "$HARNESS" in
+    claude) . "$CHOMPER_DIR/lib/harness_claude.sh" ;;
+    codex)  . "$CHOMPER_DIR/lib/harness_codex.sh" ;;
+  esac
+}
+
+# --- Doctor: environment audit ------------------------------------------
+# Inspect everything chomper needs to run. Reports per-check; aggregates
+# errors/warnings; non-zero exit on hard errors only. Intended to be the
+# first thing a user runs after install.
+run_doctor() {
+  local errors=0
+  local warns=0
+  local d_pass d_fail d_miss
+
+  d_pass() { printf '  [ok]   %s\n' "$1"; }
+  d_fail() { printf '  [FAIL] %s\n' "$1" >&2; errors=$((errors + 1)); }
+  d_miss() { printf '  [warn] %s\n' "$1" >&2; warns=$((warns + 1)); }
+
+  printf 'chomper doctor (source: %s)\n\n' "$CHOMPER_DIR"
+
+  echo "Core dependencies:"
+  if command -v git >/dev/null 2>&1; then
+    d_pass "git $(git --version | awk '{print $3}')"
+  else
+    d_fail "git not found"
+  fi
+  if command -v gh >/dev/null 2>&1; then
+    d_pass "gh $(gh --version | head -1 | awk '{print $3}')"
+  else
+    d_fail "gh not found (install: https://cli.github.com/)"
+  fi
+  if command -v jq >/dev/null 2>&1; then
+    d_pass "jq $(jq --version | sed 's/^jq-//')"
+  else
+    d_fail "jq not found"
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    d_pass "python3 $(python3 --version 2>&1 | awk '{print $2}')"
+  else
+    d_fail "python3 not found (required for config parsing and auto-answer)"
+  fi
+  echo
+
+  echo "Harness CLIs (at least one required):"
+  local have_harness=0
+  if command -v claude >/dev/null 2>&1; then
+    d_pass "claude available"; have_harness=1
+  else
+    d_miss "claude not installed"
+  fi
+  if command -v codex >/dev/null 2>&1; then
+    d_pass "codex available"; have_harness=1
+  else
+    d_miss "codex not installed"
+  fi
+  [ "$have_harness" -eq 0 ] && d_fail "no harness CLI installed; chomper cannot drive an agent"
+  echo
+
+  echo "Repo context:"
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    local host repo
+    host="$(git remote get-url origin 2>/dev/null | sed -nE 's#^(https?://|git@)([^/:]+).*#\2#p')"
+    : "${host:=github.com}"
+
+    if command -v gh >/dev/null 2>&1 && gh auth status -h "$host" >/dev/null 2>&1; then
+      d_pass "gh authenticated for $host"
+    else
+      d_fail "gh not authenticated for $host (run: gh auth login -h $host)"
+    fi
+
+    if command -v gh >/dev/null 2>&1; then
+      repo="$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || true)"
+      if [ -n "$repo" ]; then
+        d_pass "repo: $repo"
+      else
+        d_miss "git repo here, but no GitHub remote visible to gh"
+      fi
+    fi
+
+    if [ -f "$PWD/.chomper.yaml" ]; then
+      if command -v python3 >/dev/null 2>&1 \
+         && python3 "$CHOMPER_DIR/lib/parse_config.py" "$PWD/.chomper.yaml" >/dev/null 2>&1; then
+        d_pass ".chomper.yaml parses cleanly"
+      else
+        d_fail ".chomper.yaml: parse errors (run: python3 $CHOMPER_DIR/lib/parse_config.py $PWD/.chomper.yaml)"
+      fi
+    else
+      printf '  [info] .chomper.yaml: not present (built-in defaults will be used)\n'
+    fi
+  else
+    d_miss "not currently inside a git repo (chomper needs to be run from one)"
+  fi
+  echo
+
+  echo "Worktree base:"
+  local wt_root="/tmp/chomper-worktrees"
+  if mkdir -p "$wt_root" 2>/dev/null && [ -w "$wt_root" ]; then
+    d_pass "$wt_root writable"
+  else
+    d_fail "$wt_root not writable"
+  fi
+  echo
+
+  if [ "$errors" -eq 0 ] && [ "$warns" -eq 0 ]; then
+    printf 'All checks passed.\n'
+    return 0
+  fi
+  if [ "$errors" -gt 0 ]; then
+    printf '%d error(s), %d warning(s). Fix errors before running chomper.\n' "$errors" "$warns" >&2
+    return 1
+  fi
+  printf '%d warning(s); chomper should still work.\n' "$warns"
+  return 0
+}
+
+# --- Review adjudication via judge --------------------------------------
+# When wait_for_reviews is configured and a reviewer leaves a non-APPROVE
+# review, ask the judge whether the feedback warrants a fix iteration,
+# can be merged as-is, or should escalate to a human.
+
+REVIEW_JUDGE_SYSTEM_PROMPT=$(cat <<'EOF'
+You are reviewing automated code-review feedback on a GitHub pull request
+that was opened by an autonomous coding agent to address a specific issue.
+The agent has no human in the loop — your verdict determines whether it
+revises the PR, merges as-is, or hands off to a human.
+
+Classify the review into ONE action:
+
+- "merge_as_is": the review is informational, stylistic, praise, or
+  comments the agent's existing code already addresses. The PR can be
+  merged without further changes.
+
+- "needs_fix": the review identifies a concrete bug, missing test,
+  incorrect logic, broken behavior, or substantive issue in the changed
+  code. The agent will be re-invoked with the review context to revise.
+
+- "escalate": the review meaningfully expands scope beyond the original
+  issue, raises architectural concerns, requests a redesign, or is
+  ambiguous in a way that needs human judgment.
+
+Bias rules:
+- Prefer "merge_as_is" for nit-level style suggestions on a simple fix.
+- Prefer "needs_fix" for factual claims about bugs or correctness.
+- Prefer "escalate" when the reviewer is asking for something
+  meaningfully larger than the issue's stated scope.
+- A REQUEST_CHANGES state from the reviewer should bias toward
+  "needs_fix" or "escalate" — not "merge_as_is".
+
+Output ONE single-line JSON object, nothing else:
+
+  {"action": "merge_as_is", "reason": "<one sentence>"}
+or
+  {"action": "needs_fix",   "reason": "<one sentence>"}
+or
+  {"action": "escalate",    "reason": "<one sentence>"}
+EOF
+)
+
+# Run the judge against a review. Returns "merge_as_is"/"needs_fix"/"escalate"
+# on stdout, or empty on judge failure (caller should default to "needs_fix"
+# since that's the conservative path — apply the feedback rather than skip it).
+# Args: <pr_number> <reviewer_login> <review_json> <issue_json>
+judge_review() {
+  local pr_number="$1"
+  local reviewer="$2"
+  local review_json="$3"
+  local issue_json="$4"
+
+  local issue_brief
+  issue_brief="$(printf '%s' "$issue_json" | jq -c '{number, title, body}')"
+
+  # Fetch inline comments at adjudication time so the judge sees the full
+  # picture, not just the review's body. Best-effort: missing inline
+  # comments shouldn't block adjudication.
+  local inline_comments
+  inline_comments="$(gh api "repos/${REPO}/pulls/${pr_number}/comments" 2>/dev/null \
+    | jq -c '[.[] | {path, line, body, user: .user.login}]' 2>/dev/null || printf '[]')"
+
+  local prompt
+  prompt="$(cat <<EOF
+Issue:
+${issue_brief}
+
+PR: #${pr_number}
+Reviewer: ${reviewer}
+
+Review (state, body):
+$(printf '%s' "$review_json" | jq -c '{state, body, submitted_at}')
+
+Inline comments on the PR (path/line/author/body):
+${inline_comments}
+EOF
+)"
+
+  local raw
+  raw="$(CHOMPER_JUDGE_SYSTEM_PROMPT="$REVIEW_JUDGE_SYSTEM_PROMPT" \
+         CHOMPER_JUDGE_MODEL="${AUTO_ANSWER_MODEL:-}" \
+         printf '%s' "$prompt" | harness_run_judge 2>/dev/null || true)"
+
+  # Extract the action field from the judge's JSON response.
+  printf '%s' "$raw" \
+    | jq -r '
+        # Tolerate code fences or pre/post chatter by extracting the first JSON object.
+        capture("(?<j>\\{[^}]*\\})") .j? | fromjson? | .action // empty
+      ' 2>/dev/null \
+    | head -1
+}
+
+# --- Harness dispatcher --------------------------------------------------
+# Routes a single issue's harness invocation through the configured path:
+# direct (auto_answer=false) or via the judge proxy (auto_answer=true).
+# Args: <issue_number> <prompt_file> <detail_json>
+invoke_harness() {
+  local number="$1"
+  local prompt_file="$2"
+  local detail_json="$3"
+
+  if [ "$AUTO_ANSWER" != "true" ]; then
+    # In direct mode the harness buffers everything until done (claude
+    # --print, codex exec). The user sees nothing for minutes - so we
+    # animate a heartbeat to prove the loop is alive.
+    #
+    # We capture stdout+stderr instead of letting them stream so the
+    # harness's final wall-of-text doesn't collide with the spinner
+    # mid-redraw. Since --print mode buffers anyway, no real-time
+    # information is lost by capturing.
+    _start_heartbeat "${HARNESS} coding on issue #${number}"
+    local rc=0 output=''
+    output="$(harness_run_worker "$PWD" "$prompt_file" 2>&1)" || rc=$?
+    _stop_heartbeat
+    if [ -n "$output" ]; then
+      printf '%s\n' "$output"
+    fi
+    return $rc
+  fi
+
+  # Auto-answer path: judge.py emits its own progress events, so no
+  # bash heartbeat - it would interleave with the stream output.
+  local issue_ctx
+  issue_ctx="$(printf '%s' "$detail_json" | jq -c \
+                --arg repo "$REPO" \
+                '{repo: $repo, number: .number, title: .title, body: (.body // "")}')"
+
+  CHOMPER_DIR="$CHOMPER_DIR" \
+  CHOMPER_HARNESS="$HARNESS" \
+  CHOMPER_REPO_DIR="$PWD" \
+  CHOMPER_PROMPT_FILE="$prompt_file" \
+  CHOMPER_ISSUE_CONTEXT_JSON="$issue_ctx" \
+  CHOMPER_JUDGE_MODEL="$AUTO_ANSWER_MODEL" \
+  CHOMPER_MAX_QUESTIONS="$AUTO_ANSWER_MAX_QUESTIONS" \
+  CHOMPER_SILENCE_THRESHOLD_S="$AUTO_ANSWER_SILENCE_THRESHOLD_S" \
+    python3 "$CHOMPER_DIR/lib/judge.py"
+}
+
+# --- Review loop ---------------------------------------------------------
+# Wait for review from configured reviewers; on non-APPROVE, optionally
+# ask the judge whether the feedback is actionable; on needs_fix, re-invoke
+# the harness in the worktree to revise; loop until APPROVE, merge_as_is,
+# timeout (=> proceed to merge), escalate (=> preserve & abort), or
+# max_iterations exhausted (=> preserve & abort).
+#
+# Returns 0 to continue to the merge step, non-zero to abort the issue.
+# Args: <pr_number> <issue_detail_json> <worktree_dir> <issue_number>
+review_loop() {
+  local pr_number="$1"
+  local detail_json="$2"
+  local worktree_dir="$3"
+  local number="$4"
+
+  local iter=0
+  # "since" timestamp: any review submitted at or before this is considered
+  # already seen. Start from "now" so we only react to reviews that come
+  # after CI turned green.
+  local since
+  since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  while [ "$iter" -lt "$REVIEW_MAX_ITERATIONS" ]; do
+    iter=$((iter + 1))
+    info "review iteration ${iter}/${REVIEW_MAX_ITERATIONS}"
+
+    local review_json rrc=0
+    _start_heartbeat "waiting for review from ${REVIEWERS[*]}"
+    review_json="$(gh_wait_for_review "$pr_number" "$REVIEW_TIMEOUT_MINUTES" "$since" "${REVIEWERS[@]}")" || rrc=$?
+    _stop_heartbeat
+    if [ "$rrc" -ne 0 ]; then
+      if [ "$REVIEW_APPROVE_REQUIRED" = "true" ]; then
+        warn "no review within ${REVIEW_TIMEOUT_MINUTES}m and approve_state_required=true; preserving worktree at ${worktree_dir}"
+        return 1
+      fi
+      info "no review within ${REVIEW_TIMEOUT_MINUTES}m; proceeding to merge"
+      return 0
+    fi
+
+    local state reviewer
+    state="$(printf '%s' "$review_json" | jq -r '.state')"
+    reviewer="$(printf '%s' "$review_json" | jq -r '.user.login')"
+    info "review received from ${reviewer}: state=${state}"
+
+    if [ "$state" = "APPROVED" ]; then
+      info "approved; proceeding to merge"
+      return 0
+    fi
+
+    # Non-APPROVE review (COMMENT / CHANGES_REQUESTED). Decide what to do.
+    local action='needs_fix'
+    if [ "$REVIEW_JUDGE_ADJUDICATES" = "true" ]; then
+      local verdict
+      _start_heartbeat "judge: adjudicating review from ${reviewer}"
+      verdict="$(judge_review "$pr_number" "$reviewer" "$review_json" "$detail_json")"
+      _stop_heartbeat
+      case "$verdict" in
+        merge_as_is|needs_fix|escalate) action="$verdict"; info "judge verdict: ${verdict}" ;;
+        *) warn "judge returned an unparseable verdict; defaulting to needs_fix"
+           action='needs_fix' ;;
+      esac
+    fi
+
+    case "$action" in
+      merge_as_is)
+        return 0 ;;
+      escalate)
+        warn "judge: review meaningfully expands scope. Preserving worktree at ${worktree_dir} for human handling"
+        return 1 ;;
+      needs_fix)
+        # Re-invoke the harness with a review-fix prompt. The harness uses
+        # gh to read the review directly (option b).
+        local fix_prompt="/tmp/chomper_prompt_${number}_fix${iter}.md"
+        build_review_fix_prompt "$detail_json" "$pr_number" "$reviewer" "$iter" "$fix_prompt"
+        if ! ( cd "$worktree_dir" && invoke_harness "$number" "$fix_prompt" "$detail_json" ); then
+          warn "harness exited non-zero on review-fix iteration ${iter}; preserving worktree at ${worktree_dir}"
+          return 1
+        fi
+        # Bump `since` so the same review doesn't re-trigger before the
+        # reviewer has had a chance to look at the new commits.
+        since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+        # Re-poll CI on the new commits before next review iteration.
+        local crc=0
+        _start_heartbeat "polling CI on PR #${pr_number} (after review-fix ${iter})"
+        gh_poll_checks "$pr_number" "$CI_TIMEOUT_MINUTES" || crc=$?
+        _stop_heartbeat
+        if [ "$crc" -ne 0 ]; then
+          warn "CI did not pass after review-fix iteration ${iter}; preserving worktree at ${worktree_dir}"
+          return 1
+        fi
+        ;;
+    esac
+  done
+
+  warn "exhausted ${REVIEW_MAX_ITERATIONS} review iterations without resolution; preserving worktree at ${worktree_dir}"
+  return 1
+}
+
+# --- Per-issue worker ----------------------------------------------------
+# Each issue runs in its own git worktree under
+#   /tmp/chomper-worktrees/<owner>/<repo>/issue-<N>/
+# The user's main checkout is never touched - no branch switches, no pulls.
+# On success the worktree is removed and the local branch deleted. On any
+# failure (harness, no PR, CI red, merge refused) the worktree is preserved
+# for forensic inspection, with a clear recovery hint in the warning.
+process_issue() {
+  local issue_summary_json="$1"
+  local number title
+  number="$(printf '%s' "$issue_summary_json" | jq -r '.number')"
+  title="$(printf  '%s' "$issue_summary_json" | jq -r '.title')"
+
+  info "--- Working issue #${number}: ${title} ---"
+
+  local branch="fix/issue-${number}"
+  local worktree_dir="/tmp/chomper-worktrees/${REPO}/issue-${number}"
+
+  # Stale-worktree check: refuse and warn. The user may be inspecting a
+  # previous run's state, so we don't auto-clean.
+  if [ -e "$worktree_dir" ]; then
+    warn "worktree already exists at ${worktree_dir} (probably a prior unfinished run). Skipping issue #${number}. To recover: git worktree remove --force ${worktree_dir}"
+    return 0
+  fi
+
+  # Branch already exists locally (in main repo or another worktree).
+  if git show-ref --verify --quiet "refs/heads/${branch}"; then
+    warn "branch ${branch} already exists; skipping issue #${number}. To recover: git branch -D ${branch}"
+    return 0
+  fi
+
+  # Refresh origin/<trunk> in the user's main checkout - metadata only,
+  # no working-tree mutation. This is the one thing we do outside the
+  # worktree, and it's idempotent and side-effect-free.
+  if ! git fetch --quiet origin "$TRUNK_BRANCH"; then
+    warn "failed to fetch origin/${TRUNK_BRANCH}; skipping issue #${number}"
+    return 0
+  fi
+
+  # Create the worktree on a fresh branch off the just-refreshed trunk.
+  mkdir -p "$(dirname "$worktree_dir")"
+  if ! git worktree add -b "$branch" "$worktree_dir" "origin/${TRUNK_BRANCH}" >/dev/null; then
+    warn "failed to create worktree at ${worktree_dir}; skipping issue #${number}"
+    return 0
+  fi
+
+  local prompt_file="/tmp/chomper_prompt_${number}.md"
+  local detail_json
+  detail_json="$(gh_fetch_issue_detail "$number")"
+  build_prompt_file "$detail_json" "$prompt_file"
+
+  # All harness + PR work happens with the worktree as cwd. invoke_harness
+  # reads $PWD, so cd-ing here propagates through both the direct path and
+  # the auto-answer/judge.py path (which carries $PWD into CHOMPER_REPO_DIR).
+  if ! ( cd "$worktree_dir" && invoke_harness "$number" "$prompt_file" "$detail_json" ); then
+    warn "harness exited non-zero for issue #${number}; preserving worktree at ${worktree_dir} for inspection"
+    return 0
+  fi
+
+  local pr_number rc=0
+  _start_heartbeat "waiting for PR on branch ${branch}"
+  pr_number="$( cd "$worktree_dir" && gh_poll_pr "$branch" 60 )" || rc=$?
+  _stop_heartbeat
+  if [ "$rc" -ne 0 ] || [ -z "$pr_number" ]; then
+    warn "no PR opened on branch ${branch} within 60s; preserving worktree at ${worktree_dir} for inspection"
+    return 0
+  fi
+  info "found PR #${pr_number} for issue #${number}"
+
+  _start_heartbeat "polling CI on PR #${pr_number}"
+  gh_poll_checks "$pr_number" "$CI_TIMEOUT_MINUTES" || rc=$?
+  _stop_heartbeat
+  if [ "$rc" -ne 0 ]; then
+    warn "CI did not pass for PR #${pr_number} within ${CI_TIMEOUT_MINUTES}m; preserving worktree at ${worktree_dir} for inspection"
+    return 0
+  fi
+  info "CI passed on PR #${pr_number}"
+
+  if [ "${#REVIEWERS[@]}" -gt 0 ]; then
+    if ! review_loop "$pr_number" "$detail_json" "$worktree_dir" "$number"; then
+      # review_loop already preserved the worktree + logged a warning
+      return 0
+    fi
+  fi
+
+  rc=0
+  _start_heartbeat "merging PR #${pr_number}"
+  gh_merge_pr "$pr_number" "$MERGE_STRATEGY" || rc=$?
+  _stop_heartbeat
+  if [ "$rc" -ne 0 ]; then
+    warn "merge command failed for PR #${pr_number}; preserving worktree at ${worktree_dir} for inspection"
+    return 0
+  fi
+
+  # `gh pr merge --auto` may return success after only ENABLING auto-merge
+  # when branch protection adds gates beyond CI. We need the merge to
+  # actually land before tearing down the worktree, so that the next
+  # issue's worktree (created via `git fetch origin <trunk> && git
+  # worktree add ... origin/<trunk>`) sees this merge commit on trunk.
+  rc=0
+  _start_heartbeat "confirming merge of PR #${pr_number}"
+  gh_wait_for_pr_merged "$pr_number" 60 || rc=$?
+  _stop_heartbeat
+  if [ "$rc" -ne 0 ]; then
+    warn "PR #${pr_number} did not land within 60s of gh pr merge — auto-merge may be queued by branch protection. Preserving worktree at ${worktree_dir} for inspection."
+    return 0
+  fi
+
+  # Success: tear down the worktree (--force is safe here - the merge
+  # already preserved everything that mattered), then clean up the local
+  # branch (now orphaned) and the remote branch (best-effort - the repo
+  # may have "auto-delete head branches" enabled and the remote branch
+  # is already gone).
+  if ! git worktree remove --force "$worktree_dir" >/dev/null 2>&1; then
+    warn "failed to remove worktree at ${worktree_dir}; clean up manually: rm -rf ${worktree_dir} && git worktree prune"
+  fi
+  git branch -D "$branch" >/dev/null 2>&1 || true
+  gh_delete_remote_branch "$branch"
+
+  info ""
+  info "✓ Done with issue #${number} (merged via PR #${pr_number})"
+  info ""
+}
+
+# --- Main ----------------------------------------------------------------
+main() {
+  parse_args "$@"
+
+  # `doctor` is a self-contained diagnostic; it does NOT load config (the
+  # config might be the very thing that's broken) and reports its own
+  # findings instead of dying on the first failure.
+  if [ "$DOCTOR" -eq 1 ]; then
+    run_doctor
+    exit $?
+  fi
+
+  load_config
+  resolve_settings
+
+  gh_require_env
+
+  REPO="$(gh_current_repo)"
+  [ -n "$REPO" ] || die "could not determine current GitHub repo (is this a fork without a remote?)"
+
+  local issues_all issues_filtered count
+  issues_all="$(gh_fetch_open_issues)"
+  issues_filtered="$(gh_filter_issues "$issues_all" "$TITLE_MATCH" \
+                       "${LABELS[@]+"${LABELS[@]}"}")"
+  count="$(printf '%s' "$issues_filtered" | jq 'length')"
+
+  info "repo: ${REPO}"
+  info "harness: ${HARNESS}   trunk: ${TRUNK_BRANCH}   merge: ${MERGE_STRATEGY}   ci-timeout: ${CI_TIMEOUT_MINUTES}m"
+  if [ "$AUTO_ANSWER" = "true" ]; then
+    info "auto-answer: on   max-questions: ${AUTO_ANSWER_MAX_QUESTIONS}   silence: ${AUTO_ANSWER_SILENCE_THRESHOLD_S}s${AUTO_ANSWER_MODEL:+   model: $AUTO_ANSWER_MODEL}"
+  fi
+  if [ "${#LABELS[@]}" -gt 0 ]; then
+    info "label filter: ${LABELS[*]}"
+  fi
+  if [ -n "$TITLE_MATCH" ]; then
+    info "title filter: ${TITLE_MATCH}"
+  fi
+  info "matching open issues: ${count}"
+
+  if [ "$count" -eq 0 ]; then
+    info "nothing to do."
+    return 0
+  fi
+
+  printf '%s' "$issues_filtered" \
+    | jq -r '.[] | "  #\(.number)  \(.title)"'
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry run; no issues will be worked.)"
+    return 0
+  fi
+
+  # Validate harness + always source the adapter so harness_run_worker
+  # AND harness_run_judge are both callable from this shell. judge.py
+  # sources the adapter itself when needed for the auto_answer proxy;
+  # we source it here so review-adjudication (which calls
+  # harness_run_judge directly from bash) works in either mode.
+  select_harness
+  source_worker_adapter
+
+  # Iterate one issue at a time. Process substitution keeps the loop in
+  # the parent shell so `set -e` semantics apply normally.
+  local issue
+  while IFS= read -r issue; do
+    process_issue "$issue"
+  done < <(printf '%s' "$issues_filtered" | jq -c '.[]')
+}
+
+main "$@"
