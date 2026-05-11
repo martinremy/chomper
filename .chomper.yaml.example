@@ -62,3 +62,16 @@ wait_for_reviews:
   max_iterations: 10               # cap before giving up
   judge_adjudicates: true          # let judge decide if review is actionable
   approve_state_required: false    # if true, require APPROVE to merge
+
+# --- Auto-fix red CI (on by default) ---------------------------------
+#
+# When CI on a chomper-opened PR goes red, chomper fetches the failing
+# checks' log tails, re-invokes the harness with a focused fix prompt,
+# pushes the result, and re-polls CI — up to `max_iterations` times.
+# Bounded blast radius: the cap is the spend ceiling. Disable via
+# `enabled: false` if you'd rather preserve the worktree and intervene
+# manually on every failure.
+
+fix_ci:
+  enabled: true
+  max_iterations: 3                # cap before preserving worktree and aborting

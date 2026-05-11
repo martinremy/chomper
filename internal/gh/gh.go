@@ -348,6 +348,115 @@ func (c *Client) WaitForChecks(ctx context.Context, prNumber int, timeout time.D
 	}
 }
 
+// FailedCheck is a single failing check on a PR, with the tail of its
+// failed-step log included for downstream prompt construction.
+type FailedCheck struct {
+	Name    string
+	LogTail string
+}
+
+// Budgets for FailedCheckContext. Per-check is small enough that even
+// matrix builds with many failing jobs don't blow the harness context
+// window; total is the hard cap once we've stacked them.
+const (
+	failedCheckPerStepBytes = 2048
+	failedCheckTotalBytes   = 16384
+)
+
+// FailedCheckContext fetches the failed checks for a PR and returns
+// the names + truncated tails of their failed-step output.
+// Returns an empty slice (no error) when no checks failed.
+//
+// Two shell-outs per failed check: `gh pr checks --json` for the list,
+// then `gh run view --log-failed` per check that came from Actions.
+// Non-Actions checks (e.g. CodeRabbit review status) don't have a
+// fetchable run log; we surface the check name with a brief note.
+func (c *Client) FailedCheckContext(ctx context.Context, prNumber int) ([]FailedCheck, error) {
+	out, err := exec.CommandContext(ctx, "gh", "pr", "checks", strconv.Itoa(prNumber),
+		"--json", "bucket,name,link,description",
+	).Output()
+	if err != nil {
+		return nil, fmt.Errorf("gh pr checks: %w", err)
+	}
+
+	var checks []struct {
+		Bucket      string `json:"bucket"`
+		Name        string `json:"name"`
+		Link        string `json:"link"`
+		Description string `json:"description"`
+	}
+	if err := json.Unmarshal(out, &checks); err != nil {
+		return nil, fmt.Errorf("parse gh pr checks output: %w", err)
+	}
+
+	var result []FailedCheck
+	totalBytes := 0
+	for _, ch := range checks {
+		if ch.Bucket != "fail" && ch.Bucket != "cancel" {
+			continue
+		}
+		fc := FailedCheck{Name: ch.Name}
+		runID, ok := parseRunIDFromCheckURL(ch.Link)
+		if !ok {
+			// Non-Actions check (review bot, external CI) — no fetchable log.
+			fc.LogTail = "(no fetchable run log; check description: " + ch.Description + ")"
+		} else {
+			logBytes, _ := exec.CommandContext(ctx, "gh", "run", "view", runID, "--log-failed").Output()
+			fc.LogTail = truncateLogTail(string(logBytes), failedCheckPerStepBytes)
+			if fc.LogTail == "" {
+				fc.LogTail = "(empty failed-log output; check description: " + ch.Description + ")"
+			}
+		}
+		// Total-budget cap: once we hit it, swap remaining tails for a stub.
+		if totalBytes+len(fc.LogTail) > failedCheckTotalBytes {
+			fc.LogTail = fmt.Sprintf("(log omitted to keep prompt under budget; fetch via gh run view %s --log-failed)", runID)
+		}
+		totalBytes += len(fc.LogTail)
+		result = append(result, fc)
+	}
+	return result, nil
+}
+
+// parseRunIDFromCheckURL extracts the GitHub Actions run ID from a
+// check's link URL. Returns ("", false) for non-Actions URLs (e.g.
+// CodeRabbit review-link pages) or malformed inputs.
+//
+// Expected formats:
+//   https://github.com/owner/repo/actions/runs/<RUN_ID>
+//   https://github.com/owner/repo/actions/runs/<RUN_ID>/job/<JOB_ID>
+//   https://github.com/owner/repo/actions/runs/<RUN_ID>?attempt=2
+func parseRunIDFromCheckURL(url string) (string, bool) {
+	const marker = "/actions/runs/"
+	idx := strings.Index(url, marker)
+	if idx == -1 {
+		return "", false
+	}
+	rest := url[idx+len(marker):]
+	end := strings.IndexAny(rest, "/?#")
+	if end == -1 {
+		end = len(rest)
+	}
+	if end == 0 {
+		return "", false
+	}
+	return rest[:end], true
+}
+
+// truncateLogTail returns the last n bytes of s prefixed with a
+// truncation marker when truncation occurs. Aligns the cut to the
+// next newline so the tail doesn't start mid-line (improves harness
+// readability). Returns s unchanged when it fits.
+func truncateLogTail(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	tail := s[len(s)-n:]
+	if nl := strings.Index(tail, "\n"); nl != -1 && nl < len(tail)-1 {
+		tail = tail[nl+1:]
+	}
+	return fmt.Sprintf("[... %d bytes truncated, showing tail ...]\n%s", len(s)-len(tail), tail)
+}
+
 // classifyChecks interprets the bucket list from `gh pr checks`.
 // Exported via package-private use so the logic is testable in isolation.
 func classifyChecks(bucketsJSON string, inGracePeriod bool) string {

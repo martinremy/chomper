@@ -22,6 +22,15 @@ func TestDefaults_AreUsable(t *testing.T) {
 	if !reflect.DeepEqual(c.Filter.Labels, []string{"chomper"}) {
 		t.Errorf("default labels = %v, want [chomper]", c.Filter.Labels)
 	}
+	// FixCI: enabled by default with a bounded iteration cap. The cap
+	// keeps blast radius (and harness $$) predictable; the default-on
+	// matches chomper's already-agentic posture in the fresh flow.
+	if !c.FixCI.Enabled {
+		t.Errorf("default fix_ci.enabled = false, want true")
+	}
+	if c.FixCI.MaxIterations != 3 {
+		t.Errorf("default fix_ci.max_iterations = %d, want 3", c.FixCI.MaxIterations)
+	}
 }
 
 // Load merges YAML on top of Defaults; partial files leave other fields
@@ -54,6 +63,27 @@ filter:
 		}
 		if c.CITimeoutMinutes != 30 {
 			t.Errorf("CITimeoutMinutes = %d, want default 30", c.CITimeoutMinutes)
+		}
+	})
+}
+
+// fix_ci block roundtrips through the YAML loader. Disabled-with-zero
+// is a valid state because Validate skips the max_iterations check
+// when the loop is inert.
+func TestLoad_FixCIBlock(t *testing.T) {
+	withYAML(t, `
+fix_ci:
+  enabled: false
+  max_iterations: 5
+`, func(c *Config) {
+		if c.FixCI.Enabled {
+			t.Errorf("fix_ci.enabled = true, want false")
+		}
+		if c.FixCI.MaxIterations != 5 {
+			t.Errorf("fix_ci.max_iterations = %d, want 5", c.FixCI.MaxIterations)
+		}
+		if err := c.Validate(); err != nil {
+			t.Errorf("disabled fix_ci should Validate, got: %v", err)
 		}
 	})
 }
@@ -133,6 +163,17 @@ func TestValidate_RejectsBadValues(t *testing.T) {
 		{"zero ci timeout", func(c *Config) { c.CITimeoutMinutes = 0 }, "ci_timeout_minutes"},
 		{"negative max questions", func(c *Config) { c.AutoAnswerMaxQuestions = -1 }, "auto_answer_max_questions"},
 		{"zero review timeout", func(c *Config) { c.WaitForReviews.TimeoutMinutes = 0 }, "timeout_minutes"},
+		// fix_ci.max_iterations only matters when the loop is enabled —
+		// a disabled loop with max_iterations=0 should NOT error (it's
+		// inert). An enabled loop with max_iterations=0 SHOULD error.
+		{"fix_ci enabled but max=0", func(c *Config) {
+			c.FixCI.Enabled = true
+			c.FixCI.MaxIterations = 0
+		}, "fix_ci.max_iterations"},
+		{"fix_ci enabled but max negative", func(c *Config) {
+			c.FixCI.Enabled = true
+			c.FixCI.MaxIterations = -1
+		}, "fix_ci.max_iterations"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -184,10 +184,22 @@ func ProcessIssue(ctx context.Context, deps *Deps, issue gh.Issue) error {
 		return deps.GH.WaitForChecks(ctx, prNumber, time.Duration(deps.Cfg.CITimeoutMinutes)*time.Minute)
 	})
 	if err != nil {
-		warn("%s", ciFailureWarning(err, prNumber, deps.Cfg.CITimeoutMinutes, worktreeDir))
-		return nil
+		// Branch on the typed error from gh.WaitForChecks. ErrCIFailed
+		// is the only state the fix loop can act on; everything else
+		// (timeout, unknown) preserves + warns and lets the user resume
+		// or intervene manually.
+		if errors.Is(err, gh.ErrCIFailed) && deps.Cfg.FixCI.Enabled {
+			if FixCILoop(ctx, deps, prNumber, detail, worktreeDir) == FixCIAbort {
+				return nil
+			}
+			// FixCIProceed: CI is now green; fall through to reviews+merge.
+		} else {
+			warn("%s", ciFailureWarning(err, prNumber, deps.Cfg.CITimeoutMinutes, worktreeDir))
+			return nil
+		}
+	} else {
+		fmt.Printf("CI passed on PR #%d\n", prNumber)
 	}
-	fmt.Printf("CI passed on PR #%d\n", prNumber)
 
 	// Phase 3.5: wait for reviews (if any reviewers configured).
 	// ReviewLoop owns the iteration cap + judge adjudication + fix
