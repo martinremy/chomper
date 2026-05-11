@@ -23,6 +23,15 @@ type Comment struct {
 	Body   string
 }
 
+// FailedCheck is the minimal shape BuildCIFixPrompt needs about one
+// failed CI check. The LogTail is the truncated tail of the failing
+// step's output — the harness uses it to diagnose the failure without
+// needing to fetch logs itself (though it can, via `gh run view`).
+type FailedCheck struct {
+	Name    string
+	LogTail string
+}
+
 // BuildIssuePrompt renders the per-issue worker prompt. The Closes-#N
 // guidance lives in the instructions block so the harness puts the
 // auto-close marker in the PR description (matches bash v0.1).
@@ -61,6 +70,64 @@ Instructions:
 - Do not merge the PR yourself. Stop after the PR is open.
 - Do not ask for confirmation. Work autonomously to completion.
 `, issue.Number, issue.Number)
+
+	return b.String()
+}
+
+// BuildCIFixPrompt renders the CI-fix prompt for a subsequent harness
+// invocation when CI on the chomper-opened PR has gone red.
+//
+// The prompt includes:
+//   - Issue context (so the harness knows what the original change was for)
+//   - PR number and iteration counters (so the harness knows how many
+//     fix attempts are left)
+//   - Each failed check by name with its truncated log tail
+//
+// We pass log tails inline rather than asking the harness to fetch them
+// itself, for two reasons: (1) the chomper-side gh client already has
+// the data, so a round trip is wasted, and (2) the harness then sees
+// the failure verbatim with no parsing ambiguity. The harness can still
+// fetch more context via `gh run view` if the tail is insufficient.
+func BuildCIFixPrompt(issue Issue, prNumber, iter, maxIter int, failedChecks []FailedCheck) string {
+	var b strings.Builder
+
+	fmt.Fprintf(&b, `You are working autonomously on a GitHub repository.
+
+You previously opened PR #%d to address issue #%d:
+  "%s"
+
+CI is failing on the PR. This is CI-fix iteration %d of %d.
+
+The failing checks and the tails of their failed-step output (truncated):
+`, prNumber, issue.Number, issue.Title, iter, maxIter)
+
+	for _, fc := range failedChecks {
+		fmt.Fprintf(&b, "\n--- check: %s ---\n%s\n", fc.Name, fc.LogTail)
+	}
+
+	fmt.Fprintf(&b, `
+If the truncated tails are not enough context, fetch fuller logs yourself:
+
+  gh pr checks %d
+  gh run view --log-failed <run-id>
+
+Then:
+1. Diagnose what each failing check is reporting.
+2. Make the minimum code change that addresses the failures.
+3. Commit with a clear message (e.g. "fix: resolve CI failure in TestFoo").
+4. Push to the existing branch. Do NOT open a new PR.
+
+Constraints:
+- Keep the fix focused on what's failing. Do not expand scope.
+- Do NOT merge the PR.
+- Do NOT open additional PRs.
+- Do NOT ask for confirmation. Work autonomously to completion.
+
+Original issue body for context:
+---
+%s
+---
+`, prNumber, issue.Body)
 
 	return b.String()
 }

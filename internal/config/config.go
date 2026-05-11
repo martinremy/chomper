@@ -30,6 +30,7 @@ type Config struct {
 	AutoAnswerMaxQuestions int     `yaml:"auto_answer_max_questions"`
 	AutoAnswerSilenceS     int     `yaml:"auto_answer_silence_threshold_s"`
 	WaitForReviews         Reviews `yaml:"wait_for_reviews"`
+	FixCI                  FixCI   `yaml:"fix_ci"`
 }
 
 // Filter applies to issue selection.
@@ -45,6 +46,16 @@ type Reviews struct {
 	MaxIterations        int      `yaml:"max_iterations"`
 	JudgeAdjudicates     bool     `yaml:"judge_adjudicates"`
 	ApproveStateRequired bool     `yaml:"approve_state_required"`
+}
+
+// FixCI configures the auto-fix-CI loop. When CI fails red on a chomper
+// PR, the loop re-invokes the harness with failed-check context and
+// re-polls CI, up to MaxIterations times. Bounded blast radius is the
+// whole point of the cap — without it, a stubborn failure could ratchet
+// harness invocations indefinitely.
+type FixCI struct {
+	Enabled       bool `yaml:"enabled"`
+	MaxIterations int  `yaml:"max_iterations"`
 }
 
 // Defaults returns the built-in default config. Built once per invocation
@@ -64,6 +75,10 @@ func Defaults() *Config {
 			TimeoutMinutes:   15,
 			MaxIterations:    10,
 			JudgeAdjudicates: true,
+		},
+		FixCI: FixCI{
+			Enabled:       true,
+			MaxIterations: 3,
 		},
 	}
 }
@@ -146,6 +161,11 @@ func (c *Config) Validate() error {
 	}
 	if r.MaxIterations <= 0 {
 		return fmt.Errorf("invalid wait_for_reviews.max_iterations: %d", r.MaxIterations)
+	}
+	// fix_ci.max_iterations is only meaningful when the loop is enabled;
+	// don't reject a disabled-with-zero state (it's inert and that's fine).
+	if c.FixCI.Enabled && c.FixCI.MaxIterations <= 0 {
+		return fmt.Errorf("invalid fix_ci.max_iterations: %d (must be a positive integer when fix_ci.enabled is true)", c.FixCI.MaxIterations)
 	}
 	return nil
 }
