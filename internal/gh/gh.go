@@ -10,12 +10,29 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+)
+
+// Sentinel errors returned by WaitForChecks. Wrapped with %w in the actual
+// returned errors so callers can branch via errors.Is — chomper decides
+// whether to tell the user "fix the failing tests" (ErrCIFailed) or
+// "re-run, CI just hasn't finished" (ErrCITimeout) based on which one
+// is in the chain. Same chain, different action.
+var (
+	// ErrCIFailed signals that at least one check reported a terminal
+	// failure (bucket "fail" or "cancel"). Returned within seconds of
+	// the failing check appearing; re-polling alone won't help.
+	ErrCIFailed = errors.New("CI failed")
+	// ErrCITimeout signals that the WaitForChecks deadline expired with
+	// checks still pending. Re-running chomper resumes the poll and may
+	// succeed; raising ci_timeout_minutes is the other knob.
+	ErrCITimeout = errors.New("CI timed out")
 )
 
 // Client is a thin wrapper around the `gh` CLI.
@@ -315,13 +332,13 @@ func (c *Client) WaitForChecks(ctx context.Context, prNumber int, timeout time.D
 		case "pass":
 			return nil
 		case "fail":
-			return fmt.Errorf("CI failed for PR #%d", prNumber)
+			return fmt.Errorf("CI failed for PR #%d: %w", prNumber, ErrCIFailed)
 		case "pending", "wait-for-registration":
 			// keep polling
 		}
 
 		if time.Now().After(deadline) {
-			return fmt.Errorf("CI did not pass for PR #%d within %s", prNumber, timeout)
+			return fmt.Errorf("CI did not pass for PR #%d within %s: %w", prNumber, timeout, ErrCITimeout)
 		}
 		select {
 		case <-ctx.Done():

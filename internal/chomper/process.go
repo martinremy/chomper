@@ -8,6 +8,7 @@ package chomper
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -183,7 +184,7 @@ func ProcessIssue(ctx context.Context, deps *Deps, issue gh.Issue) error {
 		return deps.GH.WaitForChecks(ctx, prNumber, time.Duration(deps.Cfg.CITimeoutMinutes)*time.Minute)
 	})
 	if err != nil {
-		warn("CI did not pass for PR #%d within %dm; preserving worktree at %s for inspection", prNumber, deps.Cfg.CITimeoutMinutes, worktreeDir)
+		warn("%s", ciFailureWarning(err, prNumber, deps.Cfg.CITimeoutMinutes, worktreeDir))
 		return nil
 	}
 	fmt.Printf("CI passed on PR #%d\n", prNumber)
@@ -242,4 +243,32 @@ func convertComments(in []gh.Comment) []prompt.Comment {
 
 func warn(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "warning: "+format+"\n", args...)
+}
+
+// ciFailureWarning composes the warning text emitted when a CI poll
+// returns a terminal error. Branches on the typed errors from the gh
+// package so users can tell whether re-running chomper will help
+// (ErrCITimeout: yes — resume picks the poll back up; ErrCIFailed: not
+// until the failing checks are fixed). Unknown error types fall through
+// to a generic preserve-and-inspect message.
+func ciFailureWarning(err error, prNumber, timeoutMinutes int, worktreeDir string) string {
+	switch {
+	case errors.Is(err, gh.ErrCIFailed):
+		return fmt.Sprintf(
+			"CI is failing for PR #%d; preserving worktree at %s for inspection. "+
+				"Fix the failing checks and re-run chomper to continue.",
+			prNumber, worktreeDir,
+		)
+	case errors.Is(err, gh.ErrCITimeout):
+		return fmt.Sprintf(
+			"CI did not finish for PR #%d within %dm; preserving worktree at %s. "+
+				"Re-run chomper to continue polling, or raise ci_timeout_minutes if your CI runs are routinely longer.",
+			prNumber, timeoutMinutes, worktreeDir,
+		)
+	default:
+		return fmt.Sprintf(
+			"CI poll for PR #%d ended with an unexpected error: %s; preserving worktree at %s for inspection.",
+			prNumber, err, worktreeDir,
+		)
+	}
 }
