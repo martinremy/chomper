@@ -22,8 +22,9 @@ plumbing, and chomper keeps the loop honest.
 ## Install
 
 ```sh
-git clone https://github.com/martinremy/chomper.git ~/src/chomper
-~/src/chomper/bin/install
+git clone https://github.com/martinremy/chomper.git
+cd chomper
+bin/install
 ```
 
 The install script:
