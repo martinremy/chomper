@@ -119,7 +119,11 @@ is never touched — you can keep working in it while chomper runs.
    through the **Supervisor** if `auto_answer: true`
 5. Poll for the PR to be opened (60s timeout)
 6. Poll CI checks until green (with a 60s grace period for check
-   registration); on red, preserve worktree and abort
+   registration). On terminal failure (any check `fail`/`cancel`)
+   preserve worktree and abort with a "fix the failing checks" hint;
+   on timeout (still pending past `ci_timeout_minutes`) preserve and
+   abort with a "re-run to keep polling" hint. Re-running chomper
+   resumes the poll on the same open PR.
 7. **(Optional)** Wait for code-review bots if configured; iterate
    fix-and-review loops up to `max_iterations` times
 8. `gh pr merge --auto` with the configured strategy

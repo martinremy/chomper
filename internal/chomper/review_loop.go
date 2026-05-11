@@ -129,7 +129,7 @@ func ReviewLoop(ctx context.Context, deps *Deps, prNumber int, detail *gh.FullIs
 				return deps.GH.WaitForChecks(ctx, prNumber, time.Duration(deps.Cfg.CITimeoutMinutes)*time.Minute)
 			})
 			if err != nil {
-				warn("CI did not pass after review-fix iteration %d; preserving worktree at %s: %s", iter, worktreeDir, err)
+				warn("review-fix iteration %d: %s", iter, ciFailureWarning(err, prNumber, deps.Cfg.CITimeoutMinutes, worktreeDir))
 				return ReviewAbort
 			}
 		default:
