@@ -110,6 +110,28 @@ func TestClassifyChecks(t *testing.T) {
 	}
 }
 
+func TestParsePRState(t *testing.T) {
+	tests := []struct {
+		in   string
+		want PRState
+	}{
+		{"OPEN", PRStateOpen},
+		{"open", PRStateOpen}, // tolerate lowercase
+		{"CLOSED", PRStateClosed},
+		{"MERGED", PRStateMerged},
+		{"  OPEN  ", PRStateOpen}, // tolerate whitespace
+		{"", PRStateNone},
+		{"WEIRD_FUTURE_STATE", PRStateNone},
+	}
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			if got := parsePRState(tt.in); got != tt.want {
+				t.Errorf("parsePRState(%q) = %v, want %v", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
 func numbers(issues []Issue) []int {
 	out := make([]int, len(issues))
 	for i, iss := range issues {

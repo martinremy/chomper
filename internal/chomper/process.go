@@ -36,99 +36,146 @@ type Deps struct {
 // (no PR opened, CI red, merge refused) log a warning and return nil
 // so the outer loop continues to the next issue.
 func ProcessIssue(ctx context.Context, deps *Deps, issue gh.Issue) error {
-	branch := fmt.Sprintf("fix/issue-%d", issue.Number)
+	branch := BranchForIssue(issue.Number)
 	worktreeDir := filepath.Join("/tmp/chomper-worktrees", deps.Repo, fmt.Sprintf("issue-%d", issue.Number))
 
 	fmt.Printf("--- Working issue #%d: %s ---\n", issue.Number, issue.Title)
 
-	// Stale worktree: refuse and warn (per the design decision —
-	// don't auto-clean state the user may be inspecting).
-	if _, err := os.Stat(worktreeDir); err == nil {
-		warn("worktree already exists at %s; skipping issue #%d. To recover: git worktree remove --force %s", worktreeDir, issue.Number, worktreeDir)
+	// Resume detection. Maps observed (PR state, worktree, branch) state
+	// to an Action; Decide is pure logic in resume.go and is unit-tested
+	// against the 7-row state table from issue #1.
+	facts, err := GatherResumeFacts(ctx, deps.GH, branch, worktreeDir)
+	if err != nil {
+		warn("could not query resume state for issue #%d; skipping: %s", issue.Number, err)
+		return nil
+	}
+	action := Decide(facts)
+
+	var prNumber int
+	switch action {
+	case ActionFresh:
+		// Fall through to fresh-flow setup below.
+
+	case ActionResumeReuseWorktree:
+		fmt.Printf("resume: reattaching to PR #%d (existing worktree at %s)\n", facts.PRNumber, worktreeDir)
+		prNumber = facts.PRNumber
+
+	case ActionResumeRebuildWorktree:
+		fmt.Printf("resume: reattaching to PR #%d (rebuilding worktree from origin/%s)\n", facts.PRNumber, branch)
+		if err := rebuildWorktreeFromOrigin(ctx, branch, worktreeDir); err != nil {
+			warn("resume rebuild failed for issue #%d: %s", issue.Number, err)
+			return nil
+		}
+		prNumber = facts.PRNumber
+
+	case ActionSkipPRClosed:
+		warn("PR #%d for issue #%d was closed without merging; skipping. Re-open the PR to resume, or delete the branch on origin to retry from scratch.", facts.PRNumber, issue.Number)
+		return nil
+
+	case ActionSkipPRMerged:
+		warn("PR #%d for issue #%d was already merged but the issue is still open (likely missing `Closes #%d` in the PR body); skipping. Close the issue manually if appropriate.", facts.PRNumber, issue.Number, issue.Number)
+		return nil
+
+	case ActionSkipStaleLocal:
+		// No PR on the branch, but local state from a prior aborted run
+		// is in the way. Preserve today's exact recovery hints so users
+		// with muscle memory see the same commands.
+		if facts.WorktreeExists {
+			warn("worktree already exists at %s; skipping issue #%d. To recover: git worktree remove --force %s", worktreeDir, issue.Number, worktreeDir)
+		} else {
+			warn("branch %s already exists; skipping issue #%d. To recover: git branch -D %s", branch, issue.Number, branch)
+		}
 		return nil
 	}
 
-	// Branch already exists locally (probably from a prior aborted run).
-	if git.BranchExists(ctx, branch) {
-		warn("branch %s already exists; skipping issue #%d. To recover: git branch -D %s", branch, issue.Number, branch)
-		return nil
-	}
-
-	// Refresh origin/trunk and create the worktree from it. The fetch
-	// happens against the user's main checkout (no working-tree mutation
-	// there — just a ref update), and the worktree is rooted at the
-	// just-refreshed remote-tracking ref.
-	if err := git.Fetch(ctx, "origin", deps.Cfg.TrunkBranch); err != nil {
-		warn("failed to fetch origin/%s; skipping issue #%d: %s", deps.Cfg.TrunkBranch, issue.Number, err)
-		return nil
-	}
-	if err := git.WorktreeAdd(ctx, worktreeDir, branch, "origin/"+deps.Cfg.TrunkBranch); err != nil {
-		warn("failed to create worktree at %s; skipping issue #%d: %s", worktreeDir, issue.Number, err)
-		return nil
-	}
-
-	// Fetch issue detail and render the prompt.
+	// Fetch issue detail. Needed by:
+	//   - Fresh: rendering the harness prompt
+	//   - Resume: feeding ReviewLoop's judge context if reviews are configured
+	// Cheap either way (one gh call per issue) and keeps the path uniform.
 	detail, err := deps.GH.IssueDetail(ctx, issue.Number)
 	if err != nil {
 		warn("could not fetch detail for issue #%d; preserving worktree at %s: %s", issue.Number, worktreeDir, err)
 		return nil
 	}
-	promptText := prompt.BuildIssuePrompt(prompt.Issue{
-		Number:   detail.Number,
-		Title:    detail.Title,
-		Body:     detail.Body,
-		Comments: convertComments(detail.Comments),
-	})
 
-	// Phase 1: harness work. Two paths:
-	//   - direct mode (auto_answer=false): capture output, print after spinner
-	//   - auto-answer mode (auto_answer=true): route through Supervisor,
-	//     which streams formatted events live and handles silence/questions
-	//     via the judge. No spinner — supervisor owns its own UI.
-	if deps.Cfg.AutoAnswer {
-		sup := harness.NewSupervisor(harness.SupervisorConfig{
-			Harness:          deps.Harness,
-			JudgeModel:       deps.Cfg.AutoAnswerModel,
-			SilenceThreshold: time.Duration(deps.Cfg.AutoAnswerSilenceS) * time.Second,
-			MaxQuestions:     deps.Cfg.AutoAnswerMaxQuestions,
-			IssueCtx: judge.IssueContext{
-				Repo:   deps.Repo,
-				Number: detail.Number,
-				Title:  detail.Title,
-				Body:   detail.Body,
-			},
-		})
-		if err := sup.Run(ctx, worktreeDir, promptText); err != nil {
-			warn("auto-answer supervisor failed for issue #%d; preserving worktree at %s: %s", issue.Number, worktreeDir, err)
+	// Fresh-only: create the worktree from trunk, run the harness, and
+	// poll for the PR to open. Resume paths skip all of this — they
+	// already know the PR number and the worktree is in place.
+	if action == ActionFresh {
+		if err := git.Fetch(ctx, "origin", deps.Cfg.TrunkBranch); err != nil {
+			warn("failed to fetch origin/%s; skipping issue #%d: %s", deps.Cfg.TrunkBranch, issue.Number, err)
 			return nil
 		}
-	} else {
-		var output string
-		err = tui.With(fmt.Sprintf("%s coding on issue #%d", deps.Harness.Name(), issue.Number), func() error {
-			var hErr error
-			output, hErr = deps.Harness.RunWorker(ctx, worktreeDir, promptText)
-			return hErr
-		})
-		if output != "" {
-			fmt.Println(output)
+		if err := git.WorktreeAdd(ctx, worktreeDir, branch, "origin/"+deps.Cfg.TrunkBranch); err != nil {
+			warn("failed to create worktree at %s; skipping issue #%d: %s", worktreeDir, issue.Number, err)
+			return nil
 		}
+
+		promptText := prompt.BuildIssuePrompt(prompt.Issue{
+			Number:   detail.Number,
+			Title:    detail.Title,
+			Body:     detail.Body,
+			Comments: convertComments(detail.Comments),
+		})
+
+		// Phase 1: harness work. Two paths:
+		//   - direct mode (auto_answer=false): capture output, print after spinner
+		//   - auto-answer mode (auto_answer=true): route through Supervisor,
+		//     which streams formatted events live and handles silence/questions
+		//     via the judge. No spinner — supervisor owns its own UI.
+		if deps.Cfg.AutoAnswer {
+			sup := harness.NewSupervisor(harness.SupervisorConfig{
+				Harness:          deps.Harness,
+				JudgeModel:       deps.Cfg.AutoAnswerModel,
+				SilenceThreshold: time.Duration(deps.Cfg.AutoAnswerSilenceS) * time.Second,
+				MaxQuestions:     deps.Cfg.AutoAnswerMaxQuestions,
+				IssueCtx: judge.IssueContext{
+					Repo:   deps.Repo,
+					Number: detail.Number,
+					Title:  detail.Title,
+					Body:   detail.Body,
+				},
+			})
+			if err := sup.Run(ctx, worktreeDir, promptText); err != nil {
+				warn("auto-answer supervisor failed for issue #%d; preserving worktree at %s: %s", issue.Number, worktreeDir, err)
+				return nil
+			}
+		} else {
+			var output string
+			err = tui.With(fmt.Sprintf("%s coding on issue #%d", deps.Harness.Name(), issue.Number), func() error {
+				var hErr error
+				output, hErr = deps.Harness.RunWorker(ctx, worktreeDir, promptText)
+				return hErr
+			})
+			if output != "" {
+				fmt.Println(output)
+			}
+			if err != nil {
+				warn("harness exited non-zero for issue #%d; preserving worktree at %s: %s", issue.Number, worktreeDir, err)
+				return nil
+			}
+		}
+
+		// Phase 2: poll for the PR to appear.
+		err = tui.With(fmt.Sprintf("waiting for PR on branch %s", branch), func() error {
+			var pErr error
+			prNumber, pErr = deps.GH.WaitForPR(ctx, branch, 60*time.Second)
+			return pErr
+		})
 		if err != nil {
-			warn("harness exited non-zero for issue #%d; preserving worktree at %s: %s", issue.Number, worktreeDir, err)
+			warn("no PR opened on branch %s; preserving worktree at %s for inspection", branch, worktreeDir)
 			return nil
 		}
 	}
 
-	// Phase 2: poll for the PR to appear.
-	var prNumber int
-	err = tui.With(fmt.Sprintf("waiting for PR on branch %s", branch), func() error {
-		var pErr error
-		prNumber, pErr = deps.GH.WaitForPR(ctx, branch, 60*time.Second)
-		return pErr
-	})
-	if err != nil {
-		warn("no PR opened on branch %s; preserving worktree at %s for inspection", branch, worktreeDir)
-		return nil
-	}
+	// --- Resume boundary ---------------------------------------------------
+	// Both fresh and resume paths converge here with prNumber set. Everything
+	// below MUST be idempotent: resume re-enters the pipeline at this exact
+	// line when reattaching to an existing open PR. Any new phase added below
+	// must be safe to re-run after a prior interrupted run — queries against
+	// PR/CI/review state are fine; uncommitted file mutations or
+	// branch-only-local commits are not.
+
 	fmt.Printf("found PR #%d for issue #%d\n", prNumber, issue.Number)
 
 	// Phase 3: poll CI to green.

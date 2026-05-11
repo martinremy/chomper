@@ -174,6 +174,93 @@ func (c *Client) IssueDetail(ctx context.Context, number int) (*FullIssue, error
 	return &iss, nil
 }
 
+// PRState classifies the state of a pull request as returned by
+// PRListByHead. Used by the resume resolver in internal/chomper.
+type PRState int
+
+const (
+	PRStateNone   PRState = iota // no PR exists on the queried branch
+	PRStateOpen                  // PR exists and is open
+	PRStateClosed                // PR exists, was closed without merging
+	PRStateMerged                // PR exists and was merged
+)
+
+// String renders the enum as a lowercase label for logs/errors.
+func (s PRState) String() string {
+	switch s {
+	case PRStateNone:
+		return "none"
+	case PRStateOpen:
+		return "open"
+	case PRStateClosed:
+		return "closed"
+	case PRStateMerged:
+		return "merged"
+	}
+	return "unknown"
+}
+
+// PRStatus is the result of PRListByHead: the most-recent PR (if any)
+// for a given head branch, with its state.
+type PRStatus struct {
+	State  PRState
+	Number int // 0 when State == PRStateNone
+}
+
+// PRListByHead queries `gh pr list --head <branch> --state all` and
+// returns the most-recent PR's state and number. If no PR exists on the
+// branch, returns PRStatus{State: PRStateNone, Number: 0}.
+//
+// `--state all` is load-bearing: the default `gh pr list` state is
+// `open`, so omitting this flag would silently misclassify closed and
+// merged PRs as None — and resume would incorrectly start fresh on a
+// rejected or already-landed issue.
+//
+// Multiple PRs on the same head branch are uncommon in practice (would
+// require deleting and recreating the branch between PRs). We take
+// the first result, which `gh` sorts most-recent first.
+func (c *Client) PRListByHead(ctx context.Context, branch string) (PRStatus, error) {
+	cmd := exec.CommandContext(ctx, "gh", "pr", "list",
+		"--head", branch,
+		"--state", "all",
+		"--json", "number,state",
+	)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return PRStatus{}, fmt.Errorf("gh pr list --head %s: %w (%s)", branch, err, strings.TrimSpace(stderr.String()))
+	}
+	var rows []struct {
+		Number int    `json:"number"`
+		State  string `json:"state"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &rows); err != nil {
+		return PRStatus{}, fmt.Errorf("parse gh pr list output: %w", err)
+	}
+	if len(rows) == 0 {
+		return PRStatus{State: PRStateNone}, nil
+	}
+	return PRStatus{State: parsePRState(rows[0].State), Number: rows[0].Number}, nil
+}
+
+// parsePRState maps the string state returned by `gh pr list --json
+// state` (uppercase: OPEN / CLOSED / MERGED) to our enum. Unknown
+// values fall back to PRStateNone, which makes the caller treat them
+// as "no resume" — safer than guessing.
+func parsePRState(s string) PRState {
+	switch strings.ToUpper(strings.TrimSpace(s)) {
+	case "OPEN":
+		return PRStateOpen
+	case "MERGED":
+		return PRStateMerged
+	case "CLOSED":
+		return PRStateClosed
+	default:
+		return PRStateNone
+	}
+}
+
 // WaitForPR polls for an open PR with the given head branch. Returns
 // the PR number, or an error on timeout. Tolerates transient `gh`
 // failures during polling — only the timeout produces a hard error.
