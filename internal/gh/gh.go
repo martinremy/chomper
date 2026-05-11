@@ -341,66 +341,107 @@ func (c *Client) WaitForMerged(ctx context.Context, prNumber int, timeout time.D
 	}
 }
 
-// Review is the subset of a GitHub PR review that chomper cares about.
+// Review represents reviewer activity on a PR. It unifies two
+// GitHub surfaces:
+//   - formal PR reviews (`gh api .../pulls/N/reviews`)
+//   - PR-level issue comments (`gh api .../issues/N/comments`)
+//
+// Some review bots (notably CodeRabbit on the Free plan) only post via
+// the latter — their "review" is a summary comment, never a formal
+// review object. Chomper has to look at both surfaces to detect
+// activity from configured reviewers.
+//
+// The Kind field disambiguates: "review" or "comment". State is the
+// PR-review state (APPROVED / CHANGES_REQUESTED / COMMENTED / DISMISSED)
+// for Kind=review, or the synthetic "COMMENTED" for Kind=comment.
 type Review struct {
-	ID          int64  `json:"id"`
-	State       string `json:"state"`        // APPROVED | CHANGES_REQUESTED | COMMENTED | DISMISSED
-	Body        string `json:"body"`
-	SubmittedAt string `json:"submitted_at"` // RFC3339
+	Kind        string // "review" or "comment"
+	ID          int64
+	State       string
+	Body        string
+	SubmittedAt string // RFC3339
 	User        struct {
-		Login string `json:"login"`
-	} `json:"user"`
+		Login string
+	}
 }
 
-// WaitForReview polls the PR for a review submitted after `since` by
-// any of the configured reviewer logins. Returns the matching review
-// (latest if multiple) or an error on timeout.
+// SeenReviews tracks IDs of reviews/comments chomper has already
+// processed, so subsequent poll iterations skip them. The two ID
+// spaces (reviews vs issue comments) are separate, so we track them
+// in two maps.
+type SeenReviews struct {
+	ReviewIDs  map[int64]bool
+	CommentIDs map[int64]bool
+}
+
+// NewSeenReviews returns an empty seen-set ready for the review loop.
+func NewSeenReviews() *SeenReviews {
+	return &SeenReviews{
+		ReviewIDs:  make(map[int64]bool),
+		CommentIDs: make(map[int64]bool),
+	}
+}
+
+// Mark records that we've processed this Review.
+func (s *SeenReviews) Mark(r *Review) {
+	if r.Kind == "review" {
+		s.ReviewIDs[r.ID] = true
+	} else {
+		s.CommentIDs[r.ID] = true
+	}
+}
+
+func (s *SeenReviews) has(kind string, id int64) bool {
+	if kind == "review" {
+		return s.ReviewIDs[id]
+	}
+	return s.CommentIDs[id]
+}
+
+// reviewerMatches reports whether actualLogin matches any of the
+// configured reviewer logins. Tolerant of the [bot] suffix: GitHub
+// returns "coderabbitai[bot]" from the issue-comments API and
+// "coderabbitai" from `gh pr view --json comments`. We strip the
+// suffix from both sides before comparing so user configs are
+// portable across endpoints.
+func reviewerMatches(configured []string, actualLogin string) bool {
+	actualNorm := strings.TrimSuffix(actualLogin, "[bot]")
+	for _, c := range configured {
+		if strings.TrimSuffix(c, "[bot]") == actualNorm {
+			return true
+		}
+	}
+	return false
+}
+
+// WaitForReview polls the PR for new activity from any configured
+// reviewer. Polls BOTH /reviews and /issues/N/comments, returning the
+// most recent unseen item (by SubmittedAt) from any matching login.
+// Returns an error on timeout.
 //
-// `since` is an RFC3339 timestamp ("2026-05-10T15:00:00Z"). Reviews
-// submitted before or at this time are ignored — important for fix
-// iterations, where we don't want to re-match the review that
-// triggered the previous iteration.
+// `seen` tracks which review/comment IDs have already been processed
+// — iter 1 starts with an empty seen-set, so existing activity (e.g.,
+// a CodeRabbit summary that posted before chomper entered this loop)
+// is correctly picked up. Subsequent iterations skip already-seen IDs.
 func (c *Client) WaitForReview(ctx context.Context, prNumber int,
-	reviewers []string, since string, timeout time.Duration) (*Review, error) {
+	reviewers []string, seen *SeenReviews, timeout time.Duration) (*Review, error) {
 	if len(reviewers) == 0 {
 		return nil, fmt.Errorf("no reviewers configured")
+	}
+	if seen == nil {
+		seen = NewSeenReviews()
 	}
 	repo, err := c.CurrentRepo(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("current repo: %w", err)
-	}
-	reviewerSet := make(map[string]bool, len(reviewers))
-	for _, r := range reviewers {
-		reviewerSet[r] = true
 	}
 
 	deadline := time.Now().Add(timeout)
 	const interval = 20 * time.Second
 
 	for {
-		raw, err := exec.CommandContext(ctx, "gh", "api",
-			fmt.Sprintf("repos/%s/pulls/%d/reviews", repo, prNumber),
-		).Output()
-		if err == nil {
-			var all []Review
-			if jerr := json.Unmarshal(raw, &all); jerr == nil {
-				var best *Review
-				for i := range all {
-					r := &all[i]
-					if !reviewerSet[r.User.Login] {
-						continue
-					}
-					if r.SubmittedAt <= since {
-						continue
-					}
-					if best == nil || r.SubmittedAt > best.SubmittedAt {
-						best = r
-					}
-				}
-				if best != nil {
-					return best, nil
-				}
-			}
+		if r := c.fetchLatestUnseenReview(ctx, repo, prNumber, reviewers, seen); r != nil {
+			return r, nil
 		}
 
 		if time.Now().After(deadline) {
@@ -412,6 +453,88 @@ func (c *Client) WaitForReview(ctx context.Context, prNumber int,
 		case <-time.After(interval):
 		}
 	}
+}
+
+// fetchLatestUnseenReview hits both endpoints once, returns the
+// newest unseen reviewer-authored item, or nil if nothing matched.
+// Extracted from the polling loop so testing the matching logic
+// doesn't require running the full poll.
+func (c *Client) fetchLatestUnseenReview(ctx context.Context, repo string, prNumber int,
+	reviewers []string, seen *SeenReviews) *Review {
+	var best *Review
+
+	// Formal PR reviews (CodeRabbit Pro, human reviewers, etc.)
+	if raw, err := exec.CommandContext(ctx, "gh", "api",
+		fmt.Sprintf("repos/%s/pulls/%d/reviews", repo, prNumber),
+	).Output(); err == nil {
+		var formal []struct {
+			ID          int64  `json:"id"`
+			State       string `json:"state"`
+			Body        string `json:"body"`
+			SubmittedAt string `json:"submitted_at"`
+			User        struct {
+				Login string `json:"login"`
+			} `json:"user"`
+		}
+		if jerr := json.Unmarshal(raw, &formal); jerr == nil {
+			for _, r := range formal {
+				if !reviewerMatches(reviewers, r.User.Login) {
+					continue
+				}
+				if seen.has("review", r.ID) {
+					continue
+				}
+				candidate := &Review{
+					Kind:        "review",
+					ID:          r.ID,
+					State:       r.State,
+					Body:        r.Body,
+					SubmittedAt: r.SubmittedAt,
+				}
+				candidate.User.Login = r.User.Login
+				if best == nil || candidate.SubmittedAt > best.SubmittedAt {
+					best = candidate
+				}
+			}
+		}
+	}
+
+	// PR-level issue comments (CodeRabbit Free's summary posts here).
+	if raw, err := exec.CommandContext(ctx, "gh", "api",
+		fmt.Sprintf("repos/%s/issues/%d/comments", repo, prNumber),
+	).Output(); err == nil {
+		var comments []struct {
+			ID        int64  `json:"id"`
+			Body      string `json:"body"`
+			CreatedAt string `json:"created_at"`
+			User      struct {
+				Login string `json:"login"`
+			} `json:"user"`
+		}
+		if jerr := json.Unmarshal(raw, &comments); jerr == nil {
+			for _, c := range comments {
+				if !reviewerMatches(reviewers, c.User.Login) {
+					continue
+				}
+				if seen.has("comment", c.ID) {
+					continue
+				}
+				candidate := &Review{
+					Kind:        "comment",
+					ID:          c.ID,
+					State:       "COMMENTED", // synthetic; comments have no review-state
+					Body:        c.Body,
+					SubmittedAt: c.CreatedAt,
+				}
+				candidate.User.Login = c.User.Login
+				if best == nil || candidate.SubmittedAt > best.SubmittedAt {
+					best = candidate
+				}
+			}
+		}
+	}
+
+	return best
 }
 
 // InlineReviewComments fetches the PR's inline-line review comments

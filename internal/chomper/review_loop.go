@@ -45,10 +45,11 @@ func ReviewLoop(ctx context.Context, deps *Deps, prNumber int, detail *gh.FullIs
 		Body:   detail.Body,
 	}
 
-	// "since" floor: ignore reviews submitted before this timestamp.
-	// Bumped after each fix iteration so we only react to *new*
-	// reviews of the new commits.
-	since := time.Now().UTC().Format(time.RFC3339)
+	// Track which reviews/comments we've already processed.
+	// Empty on iter 1 so we pick up reviews that came in BEFORE
+	// chomper entered the loop (CodeRabbit posts within ~10s of PR
+	// open; chomper gets here only after CI passes, minutes later).
+	seen := gh.NewSeenReviews()
 
 	for iter := 1; iter <= maxIter; iter++ {
 		fmt.Printf("review iteration %d/%d\n", iter, maxIter)
@@ -56,7 +57,7 @@ func ReviewLoop(ctx context.Context, deps *Deps, prNumber int, detail *gh.FullIs
 		var review *gh.Review
 		err := tui.With(fmt.Sprintf("waiting for review from %v", reviewers), func() error {
 			var rerr error
-			review, rerr = deps.GH.WaitForReview(ctx, prNumber, reviewers, since, timeout)
+			review, rerr = deps.GH.WaitForReview(ctx, prNumber, reviewers, seen, timeout)
 			return rerr
 		})
 		if err != nil {
@@ -68,7 +69,8 @@ func ReviewLoop(ctx context.Context, deps *Deps, prNumber int, detail *gh.FullIs
 			return ReviewProceed
 		}
 
-		fmt.Printf("review received from %s: state=%s\n", review.User.Login, review.State)
+		seen.Mark(review)
+		fmt.Printf("review received from %s (%s): state=%s\n", review.User.Login, review.Kind, review.State)
 		if review.State == "APPROVED" {
 			fmt.Println("approved; proceeding to merge")
 			return ReviewProceed
@@ -120,11 +122,9 @@ func ReviewLoop(ctx context.Context, deps *Deps, prNumber int, detail *gh.FullIs
 				return ReviewAbort
 			}
 
-			// Bump `since` so the next iteration waits for a NEW review
-			// of the new commits, not a re-match of the prior review.
-			since = time.Now().UTC().Format(time.RFC3339)
-
 			// Re-poll CI on the new commits.
+			// (The seen-set already excludes the prior review; no
+			// additional bookkeeping needed for the next iteration.)
 			err = tui.With(fmt.Sprintf("polling CI on PR #%d (after review-fix %d)", prNumber, iter), func() error {
 				return deps.GH.WaitForChecks(ctx, prNumber, time.Duration(deps.Cfg.CITimeoutMinutes)*time.Minute)
 			})

@@ -117,3 +117,58 @@ func numbers(issues []Issue) []int {
 	}
 	return out
 }
+
+// reviewerMatches must handle the [bot] suffix that GitHub adds to bot
+// account logins on some endpoints but not others. CodeRabbit's login
+// is "coderabbitai[bot]" from the issue-comments API but "coderabbitai"
+// from gh pr view's normalized output — the user's config can use
+// either form and we should accept it.
+func TestReviewerMatches(t *testing.T) {
+	tests := []struct {
+		name       string
+		configured []string
+		actual     string
+		want       bool
+	}{
+		{"exact match", []string{"coderabbitai"}, "coderabbitai", true},
+		{"bot suffix on actual only", []string{"coderabbitai"}, "coderabbitai[bot]", true},
+		{"bot suffix on config only", []string{"coderabbitai[bot]"}, "coderabbitai", true},
+		{"bot suffix on both", []string{"coderabbitai[bot]"}, "coderabbitai[bot]", true},
+		{"mismatch", []string{"coderabbitai"}, "greptileai", false},
+		{"empty configured", []string{}, "coderabbitai", false},
+		{"empty actual", []string{"coderabbitai"}, "", false},
+		{"multiple, second matches", []string{"greptileai", "coderabbitai"}, "coderabbitai[bot]", true},
+		{"case mismatch (logins are case-sensitive)", []string{"CodeRabbitAI"}, "coderabbitai", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := reviewerMatches(tt.configured, tt.actual); got != tt.want {
+				t.Errorf("reviewerMatches(%v, %q) = %v, want %v",
+					tt.configured, tt.actual, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSeenReviews_TracksByKind(t *testing.T) {
+	s := NewSeenReviews()
+	r1 := &Review{Kind: "review", ID: 100}
+	r2 := &Review{Kind: "comment", ID: 100} // same numeric ID, different kind
+	c1 := &Review{Kind: "comment", ID: 200}
+
+	if s.has("review", 100) {
+		t.Error("fresh SeenReviews should be empty")
+	}
+	s.Mark(r1)
+	if !s.has("review", 100) {
+		t.Error("marked review not in seen-set")
+	}
+	if s.has("comment", 100) {
+		t.Error("marking a review should not also mark a comment with the same numeric ID")
+	}
+	s.Mark(r2)
+	s.Mark(c1)
+	if !s.has("comment", 100) || !s.has("comment", 200) {
+		t.Error("marked comments not in seen-set")
+	}
+}
