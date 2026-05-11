@@ -93,6 +93,13 @@ func (c *Client) CurrentHost(ctx context.Context) string {
 	return parseHost(strings.TrimSpace(string(out)))
 }
 
+// PRURL composes the user-facing URL for a PR. Kept as a pure helper
+// (host passed in rather than fetched internally) so callers can cache
+// the host across many issues and so the function is trivially testable.
+func PRURL(host, repo string, prNumber int) string {
+	return fmt.Sprintf("https://%s/%s/pull/%d", host, repo, prNumber)
+}
+
 // parseHost extracts the hostname from a git remote URL. Handles HTTPS
 // (https://host/owner/repo) and SCP-style SSH (git@host:owner/repo).
 func parseHost(url string) string {
