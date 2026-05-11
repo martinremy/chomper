@@ -69,6 +69,11 @@ wait_for_reviews:
   max_iterations: 10
   judge_adjudicates: true           # judge decides if review is actionable
   approve_state_required: false
+
+# Auto-fix red CI (on by default; the iteration cap bounds blast radius)
+fix_ci:
+  enabled: true                     # enter fix loop when CI fails on a chomper PR
+  max_iterations: 3                 # cap before preserving worktree and aborting
 ```
 
 See [`.chomper.yaml.example`](.chomper.yaml.example) for an annotated
@@ -119,11 +124,20 @@ is never touched — you can keep working in it while chomper runs.
    through the **Supervisor** if `auto_answer: true`
 5. Poll for the PR to be opened (60s timeout)
 6. Poll CI checks until green (with a 60s grace period for check
-   registration). On terminal failure (any check `fail`/`cancel`)
-   preserve worktree and abort with a "fix the failing checks" hint;
-   on timeout (still pending past `ci_timeout_minutes`) preserve and
-   abort with a "re-run to keep polling" hint. Re-running chomper
-   resumes the poll on the same open PR.
+   registration). On terminal failure (any check `fail`/`cancel`),
+   if `fix_ci.enabled` (default: true), enter the **CI-fix loop**
+   (step 6a); otherwise preserve worktree and abort with a "fix the
+   failing checks" hint. On timeout (still pending past
+   `ci_timeout_minutes`) preserve and abort with a "re-run to keep
+   polling" hint — re-running chomper resumes the poll on the same
+   open PR.
+6a. **(Conditional)** CI-fix loop: fetch the failing checks and the
+   tails of their failed-step logs, build a focused fix prompt, re-invoke
+   the harness, push to the existing branch, re-poll CI. Iterate up to
+   `fix_ci.max_iterations` times (default: 3). Exit conditions: CI
+   green (proceed to step 7), iterations exhausted, harness nonzero,
+   or CI transitions to timeout/unknown — all of the latter preserve
+   worktree and abort with a contextual warning.
 7. **(Optional)** Wait for code-review bots if configured; iterate
    fix-and-review loops up to `max_iterations` times
 8. `gh pr merge --auto` with the configured strategy
