@@ -17,6 +17,7 @@ import (
 	"github.com/martinremy/chomper/internal/gh"
 	"github.com/martinremy/chomper/internal/git"
 	"github.com/martinremy/chomper/internal/harness"
+	"github.com/martinremy/chomper/internal/judge"
 	"github.com/martinremy/chomper/internal/prompt"
 	"github.com/martinremy/chomper/internal/tui"
 )
@@ -79,21 +80,42 @@ func ProcessIssue(ctx context.Context, deps *Deps, issue gh.Issue) error {
 		Comments: convertComments(detail.Comments),
 	})
 
-	// Phase 1: harness work. Output is captured so the spinner can
-	// own the terminal line uncontested; we print it after the
-	// spinner stops.
-	var output string
-	err = tui.With(fmt.Sprintf("%s coding on issue #%d", deps.Harness.Name(), issue.Number), func() error {
-		var hErr error
-		output, hErr = deps.Harness.RunWorker(ctx, worktreeDir, promptText)
-		return hErr
-	})
-	if output != "" {
-		fmt.Println(output)
-	}
-	if err != nil {
-		warn("harness exited non-zero for issue #%d; preserving worktree at %s: %s", issue.Number, worktreeDir, err)
-		return nil
+	// Phase 1: harness work. Two paths:
+	//   - direct mode (auto_answer=false): capture output, print after spinner
+	//   - auto-answer mode (auto_answer=true): route through Supervisor,
+	//     which streams formatted events live and handles silence/questions
+	//     via the judge. No spinner — supervisor owns its own UI.
+	if deps.Cfg.AutoAnswer {
+		sup := harness.NewSupervisor(harness.SupervisorConfig{
+			Harness:          deps.Harness,
+			JudgeModel:       deps.Cfg.AutoAnswerModel,
+			SilenceThreshold: time.Duration(deps.Cfg.AutoAnswerSilenceS) * time.Second,
+			MaxQuestions:     deps.Cfg.AutoAnswerMaxQuestions,
+			IssueCtx: judge.IssueContext{
+				Repo:   deps.Repo,
+				Number: detail.Number,
+				Title:  detail.Title,
+				Body:   detail.Body,
+			},
+		})
+		if err := sup.Run(ctx, worktreeDir, promptText); err != nil {
+			warn("auto-answer supervisor failed for issue #%d; preserving worktree at %s: %s", issue.Number, worktreeDir, err)
+			return nil
+		}
+	} else {
+		var output string
+		err = tui.With(fmt.Sprintf("%s coding on issue #%d", deps.Harness.Name(), issue.Number), func() error {
+			var hErr error
+			output, hErr = deps.Harness.RunWorker(ctx, worktreeDir, promptText)
+			return hErr
+		})
+		if output != "" {
+			fmt.Println(output)
+		}
+		if err != nil {
+			warn("harness exited non-zero for issue #%d; preserving worktree at %s: %s", issue.Number, worktreeDir, err)
+			return nil
+		}
 	}
 
 	// Phase 2: poll for the PR to appear.
@@ -118,6 +140,15 @@ func ProcessIssue(ctx context.Context, deps *Deps, issue gh.Issue) error {
 		return nil
 	}
 	fmt.Printf("CI passed on PR #%d\n", prNumber)
+
+	// Phase 3.5: wait for reviews (if any reviewers configured).
+	// ReviewLoop owns the iteration cap + judge adjudication + fix
+	// loop; it returns Proceed (merge) or Abort (preserve + skip).
+	if len(deps.Cfg.WaitForReviews.Reviewers) > 0 {
+		if ReviewLoop(ctx, deps, prNumber, detail, worktreeDir) == ReviewAbort {
+			return nil
+		}
+	}
 
 	// Phase 4: merge.
 	err = tui.With(fmt.Sprintf("merging PR #%d", prNumber), func() error {

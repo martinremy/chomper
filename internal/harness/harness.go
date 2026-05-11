@@ -20,12 +20,33 @@ type Harness interface {
 	// Name returns the CLI's binary name on PATH ("claude", "codex").
 	Name() string
 
-	// RunWorker invokes the agent on an issue prompt. The agent is
-	// expected to: edit code in repoDir, commit, push, open a PR. It
-	// returns the agent's captured stdout+stderr (printed back by the
-	// caller after any spinner is stopped) and an error if the
-	// subprocess exited non-zero or was cancelled.
+	// RunWorker invokes the agent in direct (non-streaming) mode. The
+	// agent is expected to: edit code in repoDir, commit, push, open a
+	// PR. RunWorker returns the agent's captured stdout+stderr (printed
+	// back by the caller after any spinner is stopped) and an error if
+	// the subprocess exited non-zero or was cancelled.
 	RunWorker(ctx context.Context, repoDir, prompt string) (output string, err error)
+
+	// RunWorkerStream is the streaming-I/O counterpart of RunWorker for
+	// use by the Supervisor. The returned process keeps stdin open
+	// (for tool_result injection) and emits line-delimited stream-json
+	// events on stdout. The initial prompt is sent as the first
+	// stream-json user event before the function returns.
+	//
+	// Harnesses that don't support stream-json (codex today) return an
+	// error; the supervisor surfaces this so chomper can refuse to
+	// enable auto-answer for that harness.
+	RunWorkerStream(ctx context.Context, repoDir, prompt string) (*WorkerProcess, error)
+
+	// RunJudge invokes the harness as a one-shot text judge with no
+	// tool access. The Supervisor uses it for silence classification
+	// and question answering; the review loop uses it for review
+	// adjudication. All three roles share this single entry point and
+	// differ only in their system prompt.
+	//
+	// model may be empty — the adapter picks a sensible cheap default
+	// (e.g., Haiku for claude).
+	RunJudge(ctx context.Context, systemPrompt, userPrompt, model string) (string, error)
 }
 
 // New returns the harness implementation matching name.

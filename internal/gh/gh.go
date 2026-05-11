@@ -341,6 +341,101 @@ func (c *Client) WaitForMerged(ctx context.Context, prNumber int, timeout time.D
 	}
 }
 
+// Review is the subset of a GitHub PR review that chomper cares about.
+type Review struct {
+	ID          int64  `json:"id"`
+	State       string `json:"state"`        // APPROVED | CHANGES_REQUESTED | COMMENTED | DISMISSED
+	Body        string `json:"body"`
+	SubmittedAt string `json:"submitted_at"` // RFC3339
+	User        struct {
+		Login string `json:"login"`
+	} `json:"user"`
+}
+
+// WaitForReview polls the PR for a review submitted after `since` by
+// any of the configured reviewer logins. Returns the matching review
+// (latest if multiple) or an error on timeout.
+//
+// `since` is an RFC3339 timestamp ("2026-05-10T15:00:00Z"). Reviews
+// submitted before or at this time are ignored — important for fix
+// iterations, where we don't want to re-match the review that
+// triggered the previous iteration.
+func (c *Client) WaitForReview(ctx context.Context, prNumber int,
+	reviewers []string, since string, timeout time.Duration) (*Review, error) {
+	if len(reviewers) == 0 {
+		return nil, fmt.Errorf("no reviewers configured")
+	}
+	repo, err := c.CurrentRepo(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("current repo: %w", err)
+	}
+	reviewerSet := make(map[string]bool, len(reviewers))
+	for _, r := range reviewers {
+		reviewerSet[r] = true
+	}
+
+	deadline := time.Now().Add(timeout)
+	const interval = 20 * time.Second
+
+	for {
+		raw, err := exec.CommandContext(ctx, "gh", "api",
+			fmt.Sprintf("repos/%s/pulls/%d/reviews", repo, prNumber),
+		).Output()
+		if err == nil {
+			var all []Review
+			if jerr := json.Unmarshal(raw, &all); jerr == nil {
+				var best *Review
+				for i := range all {
+					r := &all[i]
+					if !reviewerSet[r.User.Login] {
+						continue
+					}
+					if r.SubmittedAt <= since {
+						continue
+					}
+					if best == nil || r.SubmittedAt > best.SubmittedAt {
+						best = r
+					}
+				}
+				if best != nil {
+					return best, nil
+				}
+			}
+		}
+
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("no review from %v within %s", reviewers, timeout)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(interval):
+		}
+	}
+}
+
+// InlineReviewComments fetches the PR's inline-line review comments
+// for inclusion in the judge's adjudication prompt. Best-effort:
+// returns "[]" on any failure rather than erroring.
+func (c *Client) InlineReviewComments(ctx context.Context, prNumber int) string {
+	repo, err := c.CurrentRepo(ctx)
+	if err != nil {
+		return "[]"
+	}
+	out, err := exec.CommandContext(ctx, "gh", "api",
+		fmt.Sprintf("repos/%s/pulls/%d/comments", repo, prNumber),
+		"--jq", "[.[] | {path, line, body, author: .user.login}]",
+	).Output()
+	if err != nil {
+		return "[]"
+	}
+	s := strings.TrimSpace(string(out))
+	if s == "" {
+		return "[]"
+	}
+	return s
+}
+
 // Filter applies label (OR) + title (case-insensitive substring) filters
 // and sorts results by issue number ascending.
 //

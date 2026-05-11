@@ -1,0 +1,64 @@
+# .chomper.yaml — drop this file at the root of a repo you want to chomp.
+# All keys are optional; CLI flags override these; built-in defaults
+# apply when both are unset.
+#
+# This file is parsed strictly: unknown keys are a hard error, not
+# silently ignored. Catches typos early.
+
+# Which AI harness to drive.
+#   claude  -> Anthropic Claude Code (`claude`)
+#   codex   -> OpenAI Codex CLI     (`codex`)
+harness: claude
+
+filter:
+  # Match an issue if it has ANY of these labels (OR logic).
+  # Built-in default (when unset or empty): ["chomper"] — keeps
+  # chomper deliberately scoped to issues tagged for it.
+  labels:
+    - chomper
+  #   - bug
+  #   - good first issue
+
+  # Substring match on the issue title (case-insensitive). Empty = no
+  # title filter.
+  title_match: ""
+
+# How chomper merges the PR once CI is green: squash | merge | rebase.
+merge_strategy: squash
+
+# Max minutes to wait for PR checks to pass before giving up.
+ci_timeout_minutes: 30
+
+# Branch chomper resets to between issues and that PRs target.
+# Set if your repo's default branch isn't `main`.
+trunk_branch: main
+
+# --- Auto-answer (optional) ------------------------------------------
+#
+# When enabled, chomper runs the worker harness through a Supervisor
+# that watches its stream-json output, detects silence, and uses a
+# smaller "judge" instance of the same harness to classify the
+# silence and synthesize answers. Requires harness: claude.
+
+auto_answer: false
+auto_answer_model: ""              # empty -> harness default (Haiku for claude)
+auto_answer_max_questions: 5       # abort issue after this many synth answers
+auto_answer_silence_threshold_s: 30  # silence before classifier fires
+
+# --- Wait for code-review bots (optional) ----------------------------
+#
+# Listed reviewers (e.g., coderabbitai) get a chance to review the PR
+# before chomper merges. Non-APPROVE reviews go through the judge:
+# - merge_as_is -> merge anyway (review was informational)
+# - needs_fix   -> re-invoke harness with review context, push fixes,
+#                  re-poll CI, repeat
+# - escalate    -> preserve worktree, hand off to human
+
+wait_for_reviews:
+  reviewers: []                    # empty disables the whole review loop
+  # - coderabbitai
+  # - "greptileai[bot]"
+  timeout_minutes: 15              # max wait per review iteration
+  max_iterations: 10               # cap before giving up
+  judge_adjudicates: true          # let judge decide if review is actionable
+  approve_state_required: false    # if true, require APPROVE to merge
