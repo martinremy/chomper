@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 // chomper — autonomous loop that walks open GitHub issues through to
 // merged PRs using an AI coding harness (Claude Code or Codex CLI).
 //
@@ -64,11 +68,11 @@ func run(args []string) int {
 	}
 
 	var (
-		dryRun   bool
+		dryRun      bool
 		harnessName string
-		title    string
-		labels   stringSlice
-		showHelp bool
+		title       string
+		labels      stringSlice
+		showHelp    bool
 	)
 	fs := flag.NewFlagSet("chomper", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)

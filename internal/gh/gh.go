@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 // Package gh shells out to the `gh` CLI for GitHub operations.
 //
 // We deliberately use `gh` rather than calling the GitHub API directly:
@@ -429,9 +433,10 @@ func (c *Client) FailedCheckContext(ctx context.Context, prNumber int) ([]Failed
 // CodeRabbit review-link pages) or malformed inputs.
 //
 // Expected formats:
-//   https://github.com/owner/repo/actions/runs/<RUN_ID>
-//   https://github.com/owner/repo/actions/runs/<RUN_ID>/job/<JOB_ID>
-//   https://github.com/owner/repo/actions/runs/<RUN_ID>?attempt=2
+//
+//	https://github.com/owner/repo/actions/runs/<RUN_ID>
+//	https://github.com/owner/repo/actions/runs/<RUN_ID>/job/<JOB_ID>
+//	https://github.com/owner/repo/actions/runs/<RUN_ID>?attempt=2
 func parseRunIDFromCheckURL(url string) (string, bool) {
 	const marker = "/actions/runs/"
 	idx := strings.Index(url, marker)

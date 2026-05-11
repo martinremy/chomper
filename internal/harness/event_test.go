@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 package harness
 
 import (
@@ -120,9 +124,9 @@ func TestSynthesizeToolResult_WithID(t *testing.T) {
 		Message struct {
 			Role    string `json:"role"`
 			Content []struct {
-				Type       string `json:"type"`
-				ToolUseID  string `json:"tool_use_id"`
-				Content    string `json:"content"`
+				Type      string `json:"type"`
+				ToolUseID string `json:"tool_use_id"`
+				Content   string `json:"content"`
 			} `json:"content"`
 		} `json:"message"`
 	}
