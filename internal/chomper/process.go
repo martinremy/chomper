@@ -42,6 +42,22 @@ func ProcessIssue(ctx context.Context, deps *Deps, issue gh.Issue) error {
 
 	fmt.Printf("--- Working issue #%d: %s ---\n", issue.Number, issue.Title)
 
+	// PR-link footer + inter-issue separator. Closes over prNumber so
+	// every exit path that landed on a PR (success, all preserve-and-
+	// warn aborts, skip-due-to-closed/merged) ends with a clickable URL.
+	// Paths that never got a PR (no-PR-opened, stale-local skip) leave
+	// prNumber = 0 and only the blank line fires — keeping issue
+	// boundaries visually consistent regardless of outcome. Host is
+	// fetched lazily so we don't pay the git-remote shell-out when
+	// there's no PR to link to.
+	var prNumber int
+	defer func() {
+		if prNumber > 0 {
+			fmt.Printf("view PR: %s\n", gh.PRURL(deps.GH.CurrentHost(ctx), deps.Repo, prNumber))
+		}
+		fmt.Println()
+	}()
+
 	// Resume detection. Maps observed (PR state, worktree, branch) state
 	// to an Action; Decide is pure logic in resume.go and is unit-tested
 	// against the 7-row state table from issue #1.
@@ -52,7 +68,6 @@ func ProcessIssue(ctx context.Context, deps *Deps, issue gh.Issue) error {
 	}
 	action := Decide(facts)
 
-	var prNumber int
 	switch action {
 	case ActionFresh:
 		// Fall through to fresh-flow setup below.
@@ -71,10 +86,12 @@ func ProcessIssue(ctx context.Context, deps *Deps, issue gh.Issue) error {
 
 	case ActionSkipPRClosed:
 		warn("PR #%d for issue #%d was closed without merging; skipping. Re-open the PR to resume, or delete the branch on origin to retry from scratch.", facts.PRNumber, issue.Number)
+		prNumber = facts.PRNumber
 		return nil
 
 	case ActionSkipPRMerged:
 		warn("PR #%d for issue #%d was already merged but the issue is still open (likely missing `Closes #%d` in the PR body); skipping. Close the issue manually if appropriate.", facts.PRNumber, issue.Number, issue.Number)
+		prNumber = facts.PRNumber
 		return nil
 
 	case ActionSkipStaleLocal:
@@ -238,7 +255,6 @@ func ProcessIssue(ctx context.Context, deps *Deps, issue gh.Issue) error {
 
 	fmt.Println()
 	fmt.Printf("✓ Done with issue #%d (merged via PR #%d)\n", issue.Number, prNumber)
-	fmt.Println()
 	return nil
 }
 

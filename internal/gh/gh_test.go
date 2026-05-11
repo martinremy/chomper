@@ -173,6 +173,44 @@ func TestReviewerMatches(t *testing.T) {
 	}
 }
 
+// PRURL composes the user-facing URL for an open PR. Pure function;
+// host is supplied by the caller (typically Client.CurrentHost) so the
+// URL works on github.com and any GitHub Enterprise host without
+// requiring this helper to do its own remote lookup.
+func TestPRURL(t *testing.T) {
+	tests := []struct {
+		name     string
+		host     string
+		repo     string
+		prNumber int
+		want     string
+	}{
+		{
+			"github.com",
+			"github.com", "owner/repo", 42,
+			"https://github.com/owner/repo/pull/42",
+		},
+		{
+			"enterprise host",
+			"github.enterprise.example.com", "team/svc", 1,
+			"https://github.enterprise.example.com/team/svc/pull/1",
+		},
+		{
+			"large PR number",
+			"github.com", "o/r", 999999,
+			"https://github.com/o/r/pull/999999",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := PRURL(tt.host, tt.repo, tt.prNumber); got != tt.want {
+				t.Errorf("PRURL(%q, %q, %d) = %q, want %q",
+					tt.host, tt.repo, tt.prNumber, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestParseRunIDFromCheckURL(t *testing.T) {
 	tests := []struct {
 		name string
