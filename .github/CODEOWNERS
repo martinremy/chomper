@@ -1,0 +1,6 @@
+# CODEOWNERS — @martinremy is auto-requested for review on every PR.
+# Last matching pattern wins. Add more specific rules above this catch-all
+# if and when contributors take ownership of specific areas.
+# https://docs.github.com/en/repositories/managing-your-repositories-settings-and-security/customizing-your-repository/about-code-owners
+
+*    @martinremy

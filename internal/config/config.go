@@ -1,9 +1,13 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 // Package config loads, validates, and merges chomper's settings.
 //
 // Precedence (highest first):
-//   1. CLI flags (via Apply)
-//   2. .chomper.yaml in cwd
-//   3. Built-in defaults
+//  1. CLI flags (via Apply)
+//  2. .chomper.yaml in cwd
+//  3. Built-in defaults
 //
 // Unknown YAML keys are an error — strict by design, to surface typos
 // loudly. This is the same posture the bash prototype's parse_config.py

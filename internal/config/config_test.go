@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 package config
 
 import (
@@ -154,8 +158,8 @@ func TestApply_EmptyOverridesDoNotClobber(t *testing.T) {
 
 func TestValidate_RejectsBadValues(t *testing.T) {
 	tests := []struct {
-		name     string
-		mutate   func(*Config)
+		name       string
+		mutate     func(*Config)
 		wantSubstr string
 	}{
 		{"bad harness", func(c *Config) { c.Harness = "neither" }, "harness"},

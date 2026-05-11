@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 package harness
 
 import (
@@ -34,11 +38,11 @@ type SupervisorConfig struct {
 // it by classifying silence + answering questions via the judge.
 //
 // Lifecycle:
-//   1. Spawn worker via Harness.RunWorkerStream (stdin stays open).
-//   2. Reader goroutine ships parsed Events on a buffered channel.
-//   3. Main loop selects on (event, silence-timer, ctx).
-//   4. On silence -> classify -> {keep waiting (backoff) | inject answer | abort}.
-//   5. On terminal event -> Cmd.Wait + return.
+//  1. Spawn worker via Harness.RunWorkerStream (stdin stays open).
+//  2. Reader goroutine ships parsed Events on a buffered channel.
+//  3. Main loop selects on (event, silence-timer, ctx).
+//  4. On silence -> classify -> {keep waiting (backoff) | inject answer | abort}.
+//  5. On terminal event -> Cmd.Wait + return.
 //
 // Every code path that exits the loop kills the worker on the way out
 // when an error has occurred, so abandoned subprocesses don't leak.

@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 package gh
 
 import (
@@ -16,9 +20,9 @@ func TestParseHost(t *testing.T) {
 		{"http://gh.internal.example.com/o/r.git", "gh.internal.example.com"},
 		{"git@github.com:owner/repo.git", "github.com"},
 		{"git@github.enterprise.example.com:owner/repo.git", "github.enterprise.example.com"},
-		{"", "github.com"},                          // empty -> default
-		{"ssh://something/weird", "github.com"},     // unparseable -> default
-		{"https://", "github.com"},                  // truncated -> default
+		{"", "github.com"},                      // empty -> default
+		{"ssh://something/weird", "github.com"}, // unparseable -> default
+		{"https://", "github.com"},              // truncated -> default
 	}
 	for _, tt := range tests {
 		t.Run(tt.url, func(t *testing.T) {
@@ -85,10 +89,10 @@ func TestFilter_TitleAndLabelBothRequired(t *testing.T) {
 
 func TestClassifyChecks(t *testing.T) {
 	tests := []struct {
-		name     string
-		buckets  string
-		grace    bool
-		want     string
+		name    string
+		buckets string
+		grace   bool
+		want    string
 	}{
 		{"empty in grace -> wait", `[]`, true, "wait-for-registration"},
 		{"empty after grace -> pass", `[]`, false, "pass"},
@@ -287,9 +291,9 @@ func TestTruncateLogTail(t *testing.T) {
 			wantSubstr: []string{"truncated"},
 		},
 		{
-			name:       "exactly at budget -> untouched",
-			input:      "0123456789",
-			n:          10,
+			name:        "exactly at budget -> untouched",
+			input:       "0123456789",
+			n:           10,
 			wantNoTrunc: true,
 		},
 	}
